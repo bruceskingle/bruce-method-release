@@ -7,8 +7,24 @@ right order, and the tag, the `main` branch and the published crate are always t
 
 It is the first of the `bruce-method-*` tools, for the way of working described here.
 
-**Status:** written, and tried on throwaway repositories; `release`, which needs GitHub and crates.io, is still to be
-tried on a real release. Until it has been, each repository's `docs/Release.md` has the same steps by hand.
+**Status:** releases crates to crates.io; it released its own first version, 0.1.0. Apps, which build installers,
+are still released by their own steps.
+
+## Installing
+
+Install the version published on crates.io with Cargo:
+
+```sh
+cargo install bruce-method-release
+```
+
+This builds it and puts the program in `~/.cargo/bin`, which is on the `PATH` of anyone with Cargo, so that it can be
+run from any repository's checkout, e.g. `cd ~/git/bruce-db` then `bruce-method-release status`. Run the same command
+again to update to a newer version, and `bruce-method-release --version` to see which is installed. It needs Git, the
+GitHub CLI and cargo-deny too, see [Needs](#needs).
+
+To use a version not yet published, e.g. to try a change, install it from its checkout instead, see
+[Developing](#developing).
 
 ## The method
 
