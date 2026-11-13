@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::links;
-use crate::manifest::Kind;
+use crate::manifest::{Crate, Kind, Manifests};
 use crate::process;
 use crate::repo::Repo;
 use crate::ui::Ui;
@@ -177,11 +177,17 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
         if linked {
             Outcome::Skip("linked".to_string())
         } else {
-            let ran = process::run(&repo.dir, "cargo", &["metadata", "--format-version", "1", "--locked"])?;
-            if ran.success {
+            let mut failed = Vec::new();
+            for dir in repo.cargo_dirs(&manifests) {
+                let ran = process::run(&dir, "cargo", &["metadata", "--format-version", "1", "--locked"])?;
+                if !ran.success {
+                    failed.push(in_dir(repo, &dir, &ran.tail(3)));
+                }
+            }
+            if failed.is_empty() {
                 Outcome::Pass
             } else {
-                Outcome::Fail(ran.tail(3))
+                Outcome::Fail(failed.join("\n"))
             }
         },
         ui,
@@ -200,48 +206,14 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
         ui,
     );
 
-    let cargo = |args: &[&str], ui: &mut dyn Ui| -> Result<Outcome> {
-        ui.info(&format!("  {}", process::describe("cargo", args)));
-        let ran = process::run(&repo.dir, "cargo", args)?;
-        Ok(if ran.success {
-            Outcome::Pass
-        } else {
-            Outcome::Fail(format!("\n{}", ran.tail(20)))
-        })
-    };
-
-    let formatted = repo.dir.join("rustfmt.toml").exists() || repo.dir.join(".rustfmt.toml").exists();
-    let outcome = if formatted {
-        cargo(&["fmt", "--all", "--check"], ui)?
+    let outcomes = if repo.is_workspace() {
+        workspace_checks(repo, &manifests, ui)?
     } else {
-        Outcome::Skip("no rustfmt.toml, so not formatted with rustfmt".to_string())
+        separate_crate_checks(repo, &manifests, ui)?
     };
-    add("Formatted", outcome, ui);
-
-    let outcome = cargo(
-        &["clippy", "--workspace", "--all-targets", "--", "--deny", "warnings"],
-        ui,
-    )?;
-    add("No clippy warnings", outcome, ui);
-
-    let outcome = cargo(&["test", "--workspace"], ui)?;
-    add("Tests pass", outcome, ui);
-
-    let outcome = if repo.dir.join("deny.toml").exists() {
-        cargo(&["deny", "check"], ui)?
-    } else {
-        Outcome::Skip("no deny.toml".to_string())
-    };
-    add("Licences, advisories and sources", outcome, ui);
-
-    let outcome = if manifests.kind != Kind::Crate {
-        Outcome::Skip("not published to crates.io".to_string())
-    } else if !manifests.crates.iter().any(|krate| krate.publishable) {
-        Outcome::Skip("no crate may be published".to_string())
-    } else {
-        cargo(&["publish", "--dry-run", "--workspace", "--allow-dirty"], ui)?
-    };
-    add("Would publish", outcome, ui);
+    for (name, outcome) in outcomes {
+        add(name, outcome, ui);
+    }
 
     let outcome = if !repo.dir.join(".github/workflows").exists() {
         Outcome::Skip("no GitHub workflows".to_string())
@@ -251,6 +223,208 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
     add("CI passed on GitHub", outcome, ui);
 
     Ok(checks)
+}
+
+/// Whether the repository is formatted with rustfmt, by having its settings at its root.
+fn formatted(repo: &Repo) -> bool {
+    repo.dir.join("rustfmt.toml").exists() || repo.dir.join(".rustfmt.toml").exists()
+}
+
+/// Runs cargo in a directory, reporting it as it starts, and passes if it succeeds.
+fn cargo_in(repo: &Repo, dir: &Path, args: &[&str], ui: &mut dyn Ui) -> Result<Outcome> {
+    cargo_in_each(repo, &[dir], args, ui)
+}
+
+/// Runs cargo in each of several directories, reporting each as it starts, and passes if every one succeeds, failing
+/// with what each that failed wrote.
+fn cargo_in_each(repo: &Repo, dirs: &[&Path], args: &[&str], ui: &mut dyn Ui) -> Result<Outcome> {
+    let mut failed = Vec::new();
+    for dir in dirs {
+        let place = repo.relative(dir);
+        if place == "." {
+            ui.info(&format!("  {}", process::describe("cargo", args)));
+        } else {
+            ui.info(&format!("  {}, in {place}", process::describe("cargo", args)));
+        }
+        let ran = process::run(dir, "cargo", args)?;
+        if !ran.success {
+            failed.push(in_dir(repo, dir, &ran.tail(20)));
+        }
+    }
+    Ok(if failed.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::Fail(format!("\n{}", failed.join("\n")))
+    })
+}
+
+/// What a command wrote in a directory, headed with the directory unless it is the checkout's root.
+fn in_dir(repo: &Repo, dir: &Path, text: &str) -> String {
+    let place = repo.relative(dir);
+    if place == "." {
+        text.to_string()
+    } else {
+        format!("{place}:\n{text}")
+    }
+}
+
+/// The checks of a workspace's crates, by cargo run at its root.
+fn workspace_checks(repo: &Repo, manifests: &Manifests, ui: &mut dyn Ui) -> Result<Vec<(&'static str, Outcome)>> {
+    let dir = repo.dir.as_path();
+    let mut outcomes = Vec::new();
+    outcomes.push((
+        "Formatted",
+        if formatted(repo) {
+            cargo_in(repo, dir, &["fmt", "--all", "--check"], ui)?
+        } else {
+            Outcome::Skip("no rustfmt.toml, so not formatted with rustfmt".to_string())
+        },
+    ));
+    outcomes.push((
+        "No clippy warnings",
+        cargo_in(
+            repo,
+            dir,
+            &["clippy", "--workspace", "--all-targets", "--", "--deny", "warnings"],
+            ui,
+        )?,
+    ));
+    outcomes.push(("Tests pass", cargo_in(repo, dir, &["test", "--workspace"], ui)?));
+    outcomes.push((
+        "Licences, advisories and sources",
+        if repo.dir.join("deny.toml").exists() {
+            cargo_in(repo, dir, &["deny", "check"], ui)?
+        } else {
+            Outcome::Skip("no deny.toml".to_string())
+        },
+    ));
+    outcomes.push((
+        "Would publish",
+        if manifests.kind != Kind::Crate {
+            Outcome::Skip("not published to crates.io".to_string())
+        } else if !manifests.crates.iter().any(|krate| krate.publishable) {
+            Outcome::Skip("no crate may be published".to_string())
+        } else {
+            cargo_in(repo, dir, &["publish", "--dry-run", "--workspace", "--allow-dirty"], ui)?
+        },
+    ));
+    Ok(outcomes)
+}
+
+/// The checks of a repository of separate crates, by cargo run in each crate's directory, so that its own
+/// `.cargo/config.toml` applies. A crate built for a device, e.g. a board's firmware, is checked by building it, as its
+/// tests cannot run here; a library built for a device which others of the repository use by path, e.g. a platform
+/// which needs a board's features to compile at all, is checked by building them, and published without building it
+/// on its own.
+fn separate_crate_checks(repo: &Repo, manifests: &Manifests, ui: &mut dyn Ui) -> Result<Vec<(&'static str, Outcome)>> {
+    let mut on_computer = Vec::new();
+    let mut on_device = Vec::new();
+    for krate in &manifests.crates {
+        if krate.for_device()? {
+            on_device.push(krate);
+        } else {
+            on_computer.push(krate);
+        }
+    }
+    let used_by_path = |krate: &Crate| {
+        manifests.crates.iter().any(|other| {
+            other.dependencies.iter().any(|dependency| {
+                dependency.name == krate.name
+                    && dependency
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| same_dir(path, krate.dir()))
+            })
+        })
+    };
+    let all: Vec<&Path> = manifests.crates.iter().map(|krate| krate.dir()).collect();
+    let computer: Vec<&Path> = on_computer.iter().map(|krate| krate.dir()).collect();
+    let built: Vec<&Path> = on_device
+        .iter()
+        .filter(|krate| !used_by_path(krate))
+        .map(|krate| krate.dir())
+        .collect();
+
+    let mut outcomes = Vec::new();
+    outcomes.push((
+        "Formatted",
+        if formatted(repo) {
+            cargo_in_each(repo, &all, &["fmt", "--all", "--check"], ui)?
+        } else {
+            Outcome::Skip("no rustfmt.toml, so not formatted with rustfmt".to_string())
+        },
+    ));
+    outcomes.push((
+        "No clippy warnings",
+        if computer.is_empty() {
+            Outcome::Skip("every crate is built for a device, so is checked by building it".to_string())
+        } else {
+            cargo_in_each(
+                repo,
+                &computer,
+                &["clippy", "--all-targets", "--", "--deny", "warnings"],
+                ui,
+            )?
+        },
+    ));
+    outcomes.push((
+        "Builds for its device",
+        if built.is_empty() {
+            Outcome::Skip("no crate is built for a device".to_string())
+        } else {
+            cargo_in_each(repo, &built, &["build", "--release"], ui)?
+        },
+    ));
+    outcomes.push((
+        "Tests pass",
+        if computer.is_empty() {
+            Outcome::Skip("every crate is built for a device, where its tests cannot run from here".to_string())
+        } else {
+            cargo_in_each(repo, &computer, &["test"], ui)?
+        },
+    ));
+    let deny = repo.dir.join("deny.toml");
+    outcomes.push((
+        "Licences, advisories and sources",
+        if deny.exists() {
+            let deny = deny.to_string_lossy().into_owned();
+            cargo_in_each(repo, &all, &["deny", "check", "--config", &deny], ui)?
+        } else {
+            Outcome::Skip("no deny.toml".to_string())
+        },
+    ));
+    let publishable: Vec<&Crate> = manifests.crates.iter().filter(|krate| krate.publishable).collect();
+    let outcome = if manifests.kind != Kind::Crate {
+        Outcome::Skip("not published to crates.io".to_string())
+    } else if publishable.is_empty() {
+        Outcome::Skip("no crate may be published".to_string())
+    } else {
+        let mut failed = Vec::new();
+        for krate in publishable {
+            let mut args = vec!["publish", "--dry-run", "--allow-dirty"];
+            if krate.for_device()? {
+                args.push("--no-verify");
+            }
+            if let Outcome::Fail(why) = cargo_in(repo, krate.dir(), &args, ui)? {
+                failed.push(why);
+            }
+        }
+        if failed.is_empty() {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(failed.join(""))
+        }
+    };
+    outcomes.push(("Would publish", outcome));
+    Ok(outcomes)
+}
+
+/// Whether two paths name the same directory, allowing for either being through a symbolic link.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Whether every workflow run on GitHub for a commit finished and succeeded.

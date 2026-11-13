@@ -61,6 +61,11 @@ tool finds each one as a sibling of the repository it is run in. It never names 
 be cloned somewhere else, e.g. into `/tmp/git`, to try a release from start to finish without touching the real
 checkouts. A repository's directory has the same name as the repository on GitHub.
 
+A checkout next to it counts as one of the set if it follows the method, on a `vX.Y.Z` branch or with a `releaseX.Y.Z`
+tag, so that a clone of someone else's crate kept alongside, e.g. a fork being tried, is left alone. Its crates are
+found from every `Cargo.toml` git tracks in it, not only those of the workspace at its root, so that a crate built on
+its own, e.g. a device's firmware, and a repository with no `Cargo.toml` at its root, are seen too.
+
 ### Depending on a library being developed
 
 An app, or a library, depends on the published versions of the libraries it uses, e.g. `bruce-db = "0.1.0"`, so that
@@ -128,9 +133,10 @@ part way, e.g. at a network failure, carries on from where it stopped when run a
 | `status` | The branch, version, uncommitted and unpushed changes, last release and links of this repository and of the libraries it links, with the links which can be removed. |
 | `start [X.Y.Z]` | Starts a version's branch, sets its version in `Cargo.toml`, commits and pushes it. With no version, `vX.(Y+1).0` from `main`; with a fix's version, `vX.Y.(Z+1)` from the tag `releaseX.Y.Z`. |
 | `check` | The checks a release needs, without changing anything; see below. |
-| `release` | The checks, then the squash merge to `main` by pull request, the tag, publishing from the tag, the GitHub release, the unlinks offered next to it, and `start` of the next version. |
+| `release` | The checks, then the squash merge to `main` by pull request, the tag, publishing from the tag, the GitHub release, the unlinks next to it, and `start` of the next version. The repositories next to it which link the version released are unlinked, and those which take its crates by path, e.g. `{ version = "0.1.0", path = "../lib" }` or a path alone, take that version from crates.io instead, as its checkout moves on to the next version. One requiring a version which the release does not meet is left by path. |
 | `link <library>` | Links this repository to the library's checkout next to it. |
-| `unlink [<library>]` | Removes a link, or every link which is no longer needed. |
+| `unlink [<library>]` | Removes a link, or every link which is no longer needed. Given a library, it also makes this repository's path dependencies on it dependencies on its latest release on crates.io, as `release` does. |
+| `dependencies [-v]` | Lists the libraries next to this repository which it depends on, directly or through one another, in the order to release them, a line each: a tick for one which is ready, or a cross and what is to be done, e.g. `release 0.1.0, which bruce-smart-home needs`, after which `check` in that library says what stops it. With `-v`, each with how its users take it, by path, linked or from crates.io, and the versions asked of crates.io. Changes nothing. |
 | `sync [<branch>]` | Brings this checkout, and the libraries it links, up to date with GitHub, by fast forward only, optionally switching it to another branch first; then links the libraries next to it of which it requires a version not yet published, putting each on that version's branch, e.g. on a second computer, where the links are not. |
 
 ### What a release checks
@@ -149,6 +155,21 @@ part way, e.g. at a network failure, carries on from where it stopped when run a
 A library's crates are published in the order they depend on one another, e.g. a derive macro before the library
 which uses it, from a worktree of the tag, so that what is published is exactly the tagged commit, with no links. After
 publishing, the tool checks that the packages recorded the tag's commit, in their `.cargo_vcs_info.json`.
+
+### Separate crates
+
+A repository with no `Cargo.toml` at its root is a set of separate crates, each its own workspace, e.g. a platform's
+library and a crate for each board it supports, each built for its board's chip by its own `.cargo/config.toml`,
+which Cargo reads only when run in the crate's directory. Its crates are those of every `Cargo.toml` git tracks, all
+with the same version, and each is checked, published and given the next version in its own directory:
+
+- A crate whose `.cargo/config.toml` sets a `[build] target` is built for a device. It is checked by
+  `cargo build --release`, not clippy, and its tests are not run, as they cannot run on the computer, and its runner
+  may flash a board.
+- A library built for a device which other crates of the repository use by path, e.g. a platform which compiles only
+  with a board's features, is checked by building them, and published with `--no-verify`, as it may not build on its
+  own.
+- The other crates are checked as a workspace's are, with clippy and their tests.
 
 ## Settings
 

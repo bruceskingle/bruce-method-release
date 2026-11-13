@@ -9,7 +9,7 @@ use crate::commands::check::{self, Outcome};
 use crate::commands::link;
 use crate::commands::start::{self, StartPlan};
 use crate::links;
-use crate::manifest::{Kind, Manifests};
+use crate::manifest::{Crate, Kind, Manifests};
 use crate::process;
 use crate::repo::{self, Repo};
 use crate::ui::Ui;
@@ -31,8 +31,8 @@ struct Unlink {
 }
 
 /// Releases the version on the repository's branch: checks it, squash merges it to main by pull request, tags main,
-/// publishes from the tag, makes the GitHub release, unlinks it from the repositories next to it, and starts the next
-/// version.
+/// publishes from the tag, makes the GitHub release, unlinks it from the repositories next to it, both their links and
+/// their path dependencies on it, and starts the next version.
 pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     let manifests = repo.manifests()?;
     if manifests.kind != Kind::Crate {
@@ -70,6 +70,7 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     }
 
     let unlinks = unlinks(repo, &manifests, version)?;
+    let paths = path_plans(repo, version)?;
     let next = match version.fixes() {
         Some(_) => None,
         None => Some(StartPlan {
@@ -117,6 +118,14 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
             unlink.repo.name
         ));
     }
+    for plan in &paths {
+        if !plan.names.is_empty() {
+            steps.push(plan.step());
+        }
+        for left in &plan.left {
+            steps.push(format!("Leave by path in {}, as {left}", plan.repo.name));
+        }
+    }
     match &next {
         Some(next) => steps.extend(next.steps(repo)),
         None => steps.push(
@@ -144,6 +153,9 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     }
     for unlink in &unlinks {
         link::remove_links(&unlink.repo, &unlink.names, ui)?;
+    }
+    for plan in &paths {
+        link::apply_path_dependencies(plan, ui)?;
     }
     match &next {
         Some(next) => start::apply_start(repo, next, ui)?,
@@ -209,6 +221,21 @@ fn unlinks(repo: &Repo, manifests: &Manifests, version: Version) -> Result<Vec<U
         }
     }
     Ok(unlinks)
+}
+
+/// The repositories next to this one, developed by the method, which take its crates by path, to take the version
+/// being released from crates.io instead once it is published, as their checkouts of it move on to the next version.
+fn path_plans(repo: &Repo, version: Version) -> Result<Vec<link::PathPlan>> {
+    let mut plans = Vec::new();
+    for sibling in repo.siblings()? {
+        if !sibling.follows_method()? {
+            continue;
+        }
+        if let Some(plan) = link::plan_path_dependencies(&sibling, repo, version)? {
+            plans.push(plan);
+        }
+    }
+    Ok(plans)
 }
 
 /// Squash merges the version's branch into main by pull request, opening one if there is none.
@@ -294,47 +321,106 @@ fn publish(
     remove_worktree(repo, &worktree)?;
     let path = worktree.to_string_lossy().into_owned();
     repo.git(&["worktree", "add", "--quiet", "--detach", &path, &tag])?;
-    let mut args = vec!["publish", "--workspace"];
-    for krate in manifests
-        .crates
-        .iter()
-        .filter(|krate| krate.publishable && !unpublished.contains(&krate.name))
-    {
-        args.push("--exclude");
-        args.push(&krate.name);
-    }
+    let commit = repo.commit(&tag)?;
     ui.info(&format!(
         "{}: publishing {} {version} from {tag}",
         repo.name,
         unpublished.join(", ")
     ));
-    process::visible(&worktree, "cargo", &args)?;
-    let commit = repo.commit(&tag)?;
-    for name in unpublished {
-        match recorded_commit(&worktree, name, version)? {
-            Some(recorded) if recorded == commit => {}
-            Some(recorded) => {
-                bail!("crates.io recorded {name} {version} as from {recorded}, not {tag}'s commit {commit}")
+    if repo.is_workspace() {
+        let mut args = vec!["publish", "--workspace"];
+        for krate in manifests
+            .crates
+            .iter()
+            .filter(|krate| krate.publishable && !unpublished.contains(&krate.name))
+        {
+            args.push("--exclude");
+            args.push(&krate.name);
+        }
+        process::visible(&worktree, "cargo", &args)?;
+        for name in unpublished {
+            check_recorded(&worktree.join("target/package"), name, version, &commit, ui)?;
+        }
+    } else {
+        // Each crate from its own directory, so that its own .cargo/config.toml applies, those it depends on first.
+        for krate in publishing_order(manifests, unpublished) {
+            let dir = worktree.join(repo.relative(krate.dir()));
+            let mut args = vec!["publish"];
+            // A crate for a device is checked by building it, or the crates which use it, e.g. a platform's boards,
+            // before the release, and may not compile on its own, without a board's features.
+            if krate.for_device()? {
+                args.push("--no-verify");
             }
-            None => ui.info(&format!(
-                "Could not find which commit {name} {version}'s package recorded"
-            )),
+            process::visible(&dir, "cargo", &args)?;
+            check_recorded(&dir.join("target/package"), &krate.name, version, &commit, ui)?;
         }
     }
     remove_worktree(repo, &worktree)?;
     Ok(())
 }
 
-/// The commit a crate's package recorded, from the copy Cargo unpacked to check it before publishing.
-fn recorded_commit(worktree: &Path, name: &str, version: Version) -> Result<Option<String>> {
-    let file = worktree
-        .join("target/package")
-        .join(format!("{name}-{version}"))
-        .join(".cargo_vcs_info.json");
-    if !file.exists() {
-        return Ok(None);
+/// The crates of a repository of separate crates still to publish, each after those of them it depends on.
+fn publishing_order<'a>(manifests: &'a Manifests, unpublished: &[String]) -> Vec<&'a Crate> {
+    let mut left: Vec<&Crate> = manifests
+        .crates
+        .iter()
+        .filter(|krate| unpublished.contains(&krate.name))
+        .collect();
+    let mut order = Vec::new();
+    while !left.is_empty() {
+        let waiting = |krate: &Crate, left: &[&Crate]| {
+            krate.dependencies.iter().any(|dependency| {
+                dependency.name != krate.name && left.iter().any(|other| other.name == dependency.name)
+            })
+        };
+        // A cycle cannot be published anyway; taking the first then lets cargo say why.
+        let next = left.iter().position(|krate| !waiting(krate, &left)).unwrap_or(0);
+        order.push(left.remove(next));
     }
-    let info: serde_json::Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
+    order
+}
+
+/// Checks that crates.io recorded the tag's commit as the one a crate was published from, as the package Cargo made in
+/// `package_dir` says.
+fn check_recorded(package_dir: &Path, name: &str, version: Version, commit: &str, ui: &mut dyn Ui) -> Result<()> {
+    match recorded_commit(package_dir, name, version)? {
+        Some(recorded) if recorded == commit => Ok(()),
+        Some(recorded) => {
+            bail!(
+                "crates.io recorded {name} {version} as from {recorded}, not {}'s commit {commit}",
+                version.tag()
+            )
+        }
+        None => {
+            ui.info(&format!(
+                "Could not find which commit {name} {version}'s package recorded"
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// The commit a crate's package recorded, from the copy Cargo unpacked to check it before publishing, or else from the
+/// package itself, which is all there is when it was published without checking that it builds.
+fn recorded_commit(package_dir: &Path, name: &str, version: Version) -> Result<Option<String>> {
+    let package = format!("{name}-{version}");
+    let file = package_dir.join(&package).join(".cargo_vcs_info.json");
+    let json = if file.exists() {
+        fs::read_to_string(&file)?
+    } else {
+        let crate_file = package_dir.join(format!("{package}.crate"));
+        if !crate_file.exists() {
+            return Ok(None);
+        }
+        let path = crate_file.to_string_lossy().into_owned();
+        let member = format!("{package}/.cargo_vcs_info.json");
+        let ran = process::run(package_dir, "tar", &["-xzOf", &path, &member])?;
+        if !ran.success {
+            return Ok(None);
+        }
+        ran.stdout
+    };
+    let info: serde_json::Value = serde_json::from_str(&json)?;
     Ok(info["git"]["sha1"].as_str().map(str::to_string))
 }
 
@@ -374,4 +460,52 @@ fn github_release(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> 
     );
     let _ = fs::remove_file(&file);
     made.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Dependency;
+
+    fn krate(name: &str, depends_on: &[&str]) -> Crate {
+        Crate {
+            name: name.to_string(),
+            version: "0.1.0".parse().unwrap(),
+            manifest: PathBuf::from(format!("{name}/Cargo.toml")),
+            publishable: true,
+            dependencies: depends_on
+                .iter()
+                .map(|name| Dependency {
+                    name: name.to_string(),
+                    requirement: "^0.1.0".to_string(),
+                    by_path: true,
+                    path: Some(PathBuf::from(name)),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn publishes_separate_crates_after_those_they_depend_on() {
+        let manifests = Manifests {
+            crates: vec![
+                krate("app", &["lib", "log"]),
+                krate("lib", &["derive"]),
+                krate("derive", &[]),
+            ],
+            kind: Kind::Crate,
+        };
+        let all = ["app", "lib", "derive"].map(str::to_string);
+        let order: Vec<&str> = publishing_order(&manifests, &all)
+            .iter()
+            .map(|krate| krate.name.as_str())
+            .collect();
+        assert_eq!(order, ["derive", "lib", "app"]);
+        let some = ["app", "lib"].map(str::to_string);
+        let order: Vec<&str> = publishing_order(&manifests, &some)
+            .iter()
+            .map(|krate| krate.name.as_str())
+            .collect();
+        assert_eq!(order, ["lib", "app"]);
+    }
 }

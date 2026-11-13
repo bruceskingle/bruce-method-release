@@ -372,25 +372,33 @@ pub fn link(repo: &Repo, library: &str, ui: &mut dyn Ui) -> Result<()> {
     apply_link(repo, plan, ui)
 }
 
-/// Removes a repository's links to a library, or else every link not needed.
+/// Removes a repository's links to a library, or else every link not needed. Given a library next to it which has
+/// been released, its path dependencies on the library's crates are made dependencies on the latest release on
+/// crates.io too, see plan_path_dependencies.
 pub fn unlink(repo: &Repo, library: Option<&str>, ui: &mut dyn Ui) -> Result<()> {
     let all = links_of(repo)?;
     let chosen: Vec<&Link> = match library {
-        Some(library) => {
-            let chosen: Vec<&Link> = all
-                .iter()
-                .filter(|link| link.library.as_deref() == Some(library) || link.patch.name == library)
-                .collect();
-            if chosen.is_empty() {
-                bail!("{} has no link to {library}", repo.name);
-            }
-            chosen
-        }
+        Some(library) => all
+            .iter()
+            .filter(|link| link.library.as_deref() == Some(library) || link.patch.name == library)
+            .collect(),
         None => all.iter().filter(|link| link.state.removable()).collect(),
     };
-    if chosen.is_empty() {
-        ui.info(&format!("{} has no links which can be removed", repo.name));
-        return Ok(());
+    let paths = match library {
+        Some(library) => plan_released_paths(repo, library)?,
+        None => None,
+    };
+    if chosen.is_empty() && paths.as_ref().is_none_or(|paths| paths.names.is_empty()) {
+        match library {
+            Some(library) => bail!(
+                "{} has no link to {library}, and no path dependency on it which a release on crates.io meets",
+                repo.name
+            ),
+            None => {
+                ui.info(&format!("{} has no links which can be removed", repo.name));
+                return Ok(());
+            }
+        }
     }
     let mut steps = Vec::new();
     for link in &chosen {
@@ -409,15 +417,158 @@ pub fn unlink(repo: &Repo, library: Option<&str>, ui: &mut dyn Ui) -> Result<()>
             ));
         }
     }
+    if let Some(paths) = &paths
+        && !paths.names.is_empty()
+    {
+        steps.push(paths.step());
+        for left in &paths.left {
+            steps.push(format!("Leave by path, as {left}"));
+        }
+    }
     if !ui.confirm(&format!("Unlink {}", repo.name), &steps)? {
         ui.info("Cancelled, nothing changed");
         return Ok(());
     }
-    remove_links(
-        repo,
-        &chosen.iter().map(|link| link.patch.name.clone()).collect::<Vec<_>>(),
-        ui,
-    )
+    if !chosen.is_empty() {
+        remove_links(
+            repo,
+            &chosen.iter().map(|link| link.patch.name.clone()).collect::<Vec<_>>(),
+            ui,
+        )?;
+    }
+    if let Some(paths) = &paths {
+        apply_path_dependencies(paths, ui)?;
+    }
+    Ok(())
+}
+
+/// The plan for a repository's path dependencies on the library next to it, by the library's repository name, at its
+/// latest release, if it has one on crates.io.
+fn plan_released_paths(repo: &Repo, library: &str) -> Result<Option<PathPlan>> {
+    let dir = repo.sibling_dir(library);
+    if !dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let library = Repo::at(dir);
+    let Some(release) = library.releases()?.last().copied() else {
+        return Ok(None);
+    };
+    let (theirs, _) = library.all_manifests()?;
+    let Some(krate) = theirs.crates.iter().find(|krate| krate.publishable) else {
+        return Ok(None);
+    };
+    if !repo::is_published(&krate.name, release)? {
+        return Ok(None);
+    }
+    plan_path_dependencies(repo, &library, release)
+}
+
+/// A repository's path dependencies on a library's crates, in its Cargo.toml files, to be made dependencies on a
+/// version of the library on crates.io, e.g. once it is released, see manifest::with_published.
+#[derive(Clone, Debug)]
+pub struct PathPlan {
+    pub repo: Repo,
+    pub library: String,
+    pub version: Version,
+    /// The library's crates taken by path which are to be taken from crates.io.
+    pub names: Vec<String>,
+    /// The uses left as they are, as they require another version, e.g. "app requires ^0.2.0 of lib".
+    pub left: Vec<String>,
+}
+
+impl PathPlan {
+    pub fn step(&self) -> String {
+        format!(
+            "In {}, take {} {} from crates.io rather than by path from {}",
+            self.repo.name,
+            self.names.join(", "),
+            self.version,
+            self.library
+        )
+    }
+}
+
+/// Works out which of a repository's path dependencies on the crates of the library next to it can be taken from
+/// crates.io at version: those of a path alone, and those whose version required it meets. None if it has no path
+/// dependencies on the library's crates. A path dependency is on the library only if its path is in the library's
+/// checkout, so that a crate of the same name elsewhere, e.g. a fork, is left alone.
+pub fn plan_path_dependencies(repo: &Repo, library: &Repo, version: Version) -> Result<Option<PathPlan>> {
+    let (theirs, _) = library.all_manifests()?;
+    let crates: Vec<String> = theirs
+        .crates
+        .iter()
+        .filter(|krate| krate.publishable)
+        .map(|krate| krate.name.clone())
+        .collect();
+    let library_dir = library.dir.canonicalize().unwrap_or(library.dir.clone());
+    let (ours, _) = repo.all_manifests()?;
+    let mut names: Vec<String> = Vec::new();
+    let mut left: Vec<String> = Vec::new();
+    for krate in &ours.crates {
+        for dependency in &krate.dependencies {
+            let Some(path) = &dependency.path else { continue };
+            let path = path.canonicalize().unwrap_or(path.clone());
+            if !crates.contains(&dependency.name) || !path.starts_with(&library_dir) {
+                continue;
+            }
+            if dependency.requirement == "*" || version.satisfies(&dependency.requirement) == Some(true) {
+                if !names.contains(&dependency.name) {
+                    names.push(dependency.name.clone());
+                }
+            } else {
+                left.push(format!(
+                    "{} requires {} of {}",
+                    krate.name, dependency.requirement, dependency.name
+                ));
+            }
+        }
+    }
+    if names.is_empty() && left.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathPlan {
+        repo: repo.clone(),
+        library: library.name.clone(),
+        version,
+        names,
+        left,
+    }))
+}
+
+/// Makes the path dependencies of a plan dependencies on crates.io in each of the repository's Cargo.toml files, and
+/// brings each changed crate's Cargo.lock up to date, saying what changed.
+pub fn apply_path_dependencies(plan: &PathPlan, ui: &mut dyn Ui) -> Result<()> {
+    if plan.names.is_empty() {
+        return Ok(());
+    }
+    let versions: HashMap<String, Version> = plan.names.iter().map(|name| (name.clone(), plan.version)).collect();
+    for file in plan.repo.tracked_manifests()? {
+        let changes = crate::manifest::publish_paths_in(&file, &versions)?;
+        if changes.is_empty() {
+            continue;
+        }
+        let shown = file.strip_prefix(&plan.repo.dir).unwrap_or(&file).display().to_string();
+        for change in &changes {
+            ui.info(&format!("{}: {shown}: {}", plan.repo.name, change.what));
+        }
+        let manifest = file.to_string_lossy().into_owned();
+        let ran = process::run(
+            &plan.repo.dir,
+            "cargo",
+            &["metadata", "--format-version", "1", "--manifest-path", &manifest],
+        )?;
+        if !ran.success {
+            ui.info(&format!(
+                "{}: {shown} cannot resolve its dependencies now: {}",
+                plan.repo.name,
+                ran.tail(3)
+            ));
+        }
+    }
+    for left in &plan.left {
+        ui.info(&format!("{}: left by path, as {left}", plan.repo.name));
+    }
+    Ok(())
 }
 
 /// Removes the named crates' patches from a repository, and brings its Cargo.lock up to date without them.

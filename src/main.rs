@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use bruce_method_release::commands::check::Outcome;
+use bruce_method_release::commands::dependencies::{self, Verdict};
 use bruce_method_release::commands::link::{self, State};
 use bruce_method_release::commands::{check, release, start, status, sync};
 use bruce_method_release::ui::Ui;
@@ -41,6 +42,13 @@ enum Command {
     Unlink { library: Option<String> },
     /// Brings the checkout, and the libraries it links, up to date with GitHub, by fast forward only.
     Sync { branch: Option<String> },
+    /// Lists the libraries next to this repository which it depends on, in the order to release them, each with a tick
+    /// if it is ready or a cross and what is to be done, changing nothing.
+    Dependencies {
+        /// Lists who takes each library and how, and the versions asked of crates.io, too.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 /// The command line's way of reporting and asking.
@@ -96,8 +104,17 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Link { library } => link::link(&repo, library, ui)?,
         Command::Unlink { library } => link::unlink(&repo, library.as_deref(), ui)?,
         Command::Sync { branch } => sync::sync(&repo, branch.as_deref(), ui)?,
+        Command::Dependencies { verbose: true } => {
+            succeeded = print_dependencies(&dependencies::dependencies(&repo, ui)?)
+        }
+        Command::Dependencies { verbose: false } => {
+            succeeded = print_dependencies_briefly(&dependencies::dependencies(&repo, &mut Quiet)?)
+        }
     }
-    if !matches!(cli.command, Command::Status | Command::Unlink { .. } | Command::Release) {
+    if !matches!(
+        cli.command,
+        Command::Status | Command::Unlink { .. } | Command::Release | Command::Dependencies { .. }
+    ) {
         report_removable_links(&repo)?;
     }
     Ok(succeeded)
@@ -178,6 +195,168 @@ fn print_status(repo: &Repo) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A Ui which says nothing as it goes, for a command whose result alone is wanted, e.g. `dependencies` without `-v`.
+struct Quiet;
+
+impl Ui for Quiet {
+    fn info(&mut self, _message: &str) {}
+
+    fn confirm(&mut self, _title: &str, _steps: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Lists the libraries in the order to release them, a line each, a green tick for one which is ready, a red cross
+/// and what is to be done for one which is not, returning whether they are all ready. Colours only on a terminal.
+fn print_dependencies_briefly(dependencies: &dependencies::Dependencies) -> bool {
+    use std::io::IsTerminal;
+    let colour = std::io::stdout().is_terminal();
+    let (tick, cross) = if colour {
+        ("\x1b[32m✓\x1b[0m", "\x1b[31m✗\x1b[0m")
+    } else {
+        ("✓", "✗")
+    };
+    let width = dependencies
+        .libraries
+        .iter()
+        .map(|library| library.repo.name.len())
+        .max()
+        .unwrap_or(0);
+    let mut ready = true;
+    for library in &dependencies.libraries {
+        let mark = if library.ready() { tick } else { cross };
+        ready &= library.ready();
+        println!("{mark} {:width$}  {}", library.repo.name, library.summary());
+    }
+    if !dependencies.circular.is_empty() {
+        ready = false;
+        println!(
+            "{cross} {} use each other, so no order releases them",
+            dependencies.circular.join(", ")
+        );
+    }
+    if !dependencies.unreadable.is_empty() {
+        println!(
+            "! {} Cargo.toml files could not be read, see -v",
+            dependencies.unreadable.len()
+        );
+    }
+    ready
+}
+
+/// Lists the libraries in the order to release them, each with what is to be done and who uses it, returning whether
+/// nothing needs releasing.
+fn print_dependencies(dependencies: &dependencies::Dependencies) -> bool {
+    println!();
+    if dependencies.libraries.is_empty() {
+        println!("{} depends on none of the libraries next to it", dependencies.repo);
+        return true;
+    }
+    println!(
+        "{} depends on these libraries next to it, in the order to release them:",
+        dependencies.repo
+    );
+    let mut to_release = 0;
+    for (index, library) in dependencies.libraries.iter().enumerate() {
+        println!();
+        let version = match &library.version {
+            Ok(version) => format!("checkout {version}"),
+            Err(error) => format!("checkout version unknown: {error}"),
+        };
+        let released = match library.latest_release {
+            Some(release) => format!("released {release}"),
+            None => "not released yet".to_string(),
+        };
+        println!("{}. {}, {version}, {released}", index + 1, library.repo.name);
+        match &library.verdict {
+            Verdict::Release(version) => {
+                to_release += 1;
+                println!("   RELEASE {version}");
+            }
+            Verdict::Published => println!("   nothing to release: every version needed is on crates.io"),
+            Verdict::Mismatch(why) => {
+                to_release += 1;
+                println!("   CANNOT RELEASE THE CHECKOUT: {why}");
+            }
+        }
+        for problem in &library.problems {
+            println!("   ! {problem}");
+        }
+        // Uses alike are put on one line, e.g. a repository's examples which all take it by path.
+        let mut groups: Vec<(&dependencies::Use, Vec<&str>)> = Vec::new();
+        for each in &library.uses {
+            match groups.iter_mut().find(|(first, _)| {
+                first.user_repo == each.user_repo
+                    && first.library_crate == each.library_crate
+                    && first.requirement == each.requirement
+                    && first.how == each.how
+            }) {
+                Some((_, crates)) => crates.push(&each.user_crate),
+                None => groups.push((each, vec![&each.user_crate])),
+            }
+        }
+        for (each, crates) in groups {
+            let user = match crates.as_slice() {
+                [only] if *only == each.user_repo => each.user_repo.clone(),
+                [only] => format!("{only} ({})", each.user_repo),
+                many => format!("{} crates of {}", many.len(), each.user_repo),
+            };
+            let requirement = if each.requirement == "*" {
+                "any version".to_string()
+            } else {
+                each.requirement.clone()
+            };
+            let crate_name = if each.library_crate == library.repo.name {
+                String::new()
+            } else {
+                format!("{} ", each.library_crate)
+            };
+            let on_crates_io = match (each.needs, each.published) {
+                (Some(needs), Some(true)) => format!(", {needs} is on crates.io"),
+                (Some(needs), Some(false)) => format!(", {needs} is not on crates.io"),
+                (Some(needs), None) => format!(", could not ask crates.io for {needs}"),
+                (None, _) => String::new(),
+            };
+            println!(
+                "     {user} {} {crate_name}{requirement} {}{on_crates_io}",
+                if crates.len() > 1 { "take" } else { "takes" },
+                each.how.describe()
+            );
+        }
+        if library.taken_from_checkout() {
+            let mut users: Vec<&str> = library
+                .uses
+                .iter()
+                .filter(|each| each.how != dependencies::How::CratesIo && each.published == Some(true))
+                .map(|each| each.user_repo.as_str())
+                .collect();
+            users.sort();
+            users.dedup();
+            println!(
+                "   to take it from crates.io instead: bruce-method-release unlink {} in {}",
+                library.repo.name,
+                users.join(", ")
+            );
+        }
+    }
+    println!();
+    if !dependencies.circular.is_empty() {
+        println!(
+            "! {} use each other, so no order releases them",
+            dependencies.circular.join(", ")
+        );
+    }
+    for unreadable in &dependencies.unreadable {
+        println!("! could not read {unreadable}");
+    }
+    if to_release == 0 {
+        println!("Nothing to release: {} can be built from crates.io", dependencies.repo);
+    } else {
+        println!("{to_release} to release, in that order, then {}", dependencies.repo);
+    }
+    to_release == 0
 }
 
 /// Lists the checks' outcomes, returning whether they all passed.

@@ -100,13 +100,21 @@ pub fn apply_start(repo: &Repo, plan: &StartPlan, ui: &mut dyn Ui) -> Result<()>
         manifest::set_version(file, plan.version)?;
         manifest::set_requirements_in(file, &versions)?;
     }
-    crate::process::output(&repo.dir, "cargo", &["metadata", "--format-version", "1", "--quiet"])?;
-    // The Cargo.toml files and Cargo.lock by name, as a lock file the repository did not have is new.
+    // Cargo updates each Cargo.lock to the new versions: the workspace's, or each separate crate's.
+    let dirs = repo.cargo_dirs(&manifests);
+    for dir in &dirs {
+        crate::process::output(dir, "cargo", &["metadata", "--format-version", "1", "--quiet"])?;
+    }
+    // The Cargo.toml files and Cargo.lock files by name, as a lock file the repository did not have is new.
     let mut add = vec!["add".to_string(), "--".to_string()];
     add.extend(files.iter().map(|file| file.to_string_lossy().into_owned()));
-    let ignored = crate::process::run(&repo.dir, "git", &["check-ignore", "--quiet", "Cargo.lock"])?.success;
-    if repo.dir.join("Cargo.lock").exists() && !ignored {
-        add.push("Cargo.lock".to_string());
+    for dir in &dirs {
+        let lock = dir.join("Cargo.lock");
+        let path = lock.to_string_lossy().into_owned();
+        let ignored = crate::process::run(&repo.dir, "git", &["check-ignore", "--quiet", &path])?.success;
+        if lock.exists() && !ignored {
+            add.push(path);
+        }
     }
     repo.git(&add.iter().map(String::as_str).collect::<Vec<_>>())?;
     repo.git(&["commit", "--quiet", "--message", &format!("Start {branch}")])?;

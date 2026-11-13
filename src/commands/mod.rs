@@ -2,6 +2,7 @@
 //! changing anything.
 
 pub mod check;
+pub mod dependencies;
 pub mod link;
 pub mod release;
 pub mod start;

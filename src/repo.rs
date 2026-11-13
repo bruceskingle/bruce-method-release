@@ -43,15 +43,20 @@ impl Repo {
         self.parent().join(name)
     }
 
-    /// The checkouts next to this one, of Rust repositories, not including this one.
+    /// The checkouts next to this one, of Rust repositories, not including this one: those with a Cargo.toml, at their
+    /// root or below it, as a repository of crates which are each their own workspace has none at its root.
     pub fn siblings(&self) -> Result<Vec<Repo>> {
         let mut siblings = Vec::new();
         for entry in
             fs::read_dir(self.parent()).with_context(|| format!("could not list {}", self.parent().display()))?
         {
             let dir = entry?.path();
-            if dir != self.dir && dir.join(".git").exists() && dir.join("Cargo.toml").exists() {
-                siblings.push(Repo::at(dir));
+            if dir == self.dir || !dir.join(".git").exists() {
+                continue;
+            }
+            let sibling = Repo::at(dir);
+            if sibling.dir.join("Cargo.toml").exists() || !sibling.tracked_manifests()?.is_empty() {
+                siblings.push(sibling);
             }
         }
         siblings.sort_by(|a, b| a.name.cmp(&b.name));
@@ -63,9 +68,75 @@ impl Repo {
         process::output(&self.dir, "git", args)
     }
 
-    /// The crates of the repository.
+    /// Whether the repository is one workspace, with a Cargo.toml at its root, rather than separate crates, each its
+    /// own workspace, e.g. a platform's library and its boards, each built for its own chip by its own
+    /// `.cargo/config.toml`, which Cargo reads only when run in the crate's directory.
+    pub fn is_workspace(&self) -> bool {
+        self.dir.join("Cargo.toml").exists()
+    }
+
+    /// The crates of the repository: its workspace's, or, if it has separate crates, every crate git tracks.
     pub fn manifests(&self) -> Result<Manifests> {
-        Manifests::read(&self.dir).with_context(|| format!("{}: could not read its Cargo.toml", self.name))
+        if self.is_workspace() {
+            return Manifests::read(&self.dir).with_context(|| format!("{}: could not read its Cargo.toml", self.name));
+        }
+        let (manifests, unreadable) = self.all_manifests()?;
+        if !unreadable.is_empty() {
+            bail!("{}: could not read {}", self.name, unreadable.join("; "));
+        }
+        if manifests.crates.is_empty() {
+            bail!("{}: has no Cargo.toml", self.name);
+        }
+        Ok(manifests)
+    }
+
+    /// The directories Cargo is run in for every crate of the repository, each with its own Cargo.lock: the root, for
+    /// a workspace, or else each crate's.
+    pub fn cargo_dirs(&self, manifests: &Manifests) -> Vec<PathBuf> {
+        if self.is_workspace() {
+            vec![self.dir.clone()]
+        } else {
+            manifests.crates.iter().map(|krate| krate.dir().to_path_buf()).collect()
+        }
+    }
+
+    /// A directory of the checkout as it is named in messages, relative to the checkout.
+    pub fn relative(&self, dir: &Path) -> String {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let root = self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone());
+        match dir.strip_prefix(&root) {
+            Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => dir.display().to_string(),
+        }
+    }
+
+    /// Whether the repository is developed and released by the method: it is on a version's branch, e.g. v0.2.0, or
+    /// has a release's tag, e.g. release0.1.0, so that a checkout of someone else's crate next to it, e.g. a fork being
+    /// tried, is not taken for one of the libraries to release.
+    pub fn follows_method(&self) -> Result<bool> {
+        if self.branch()?.as_deref().and_then(Version::from_branch).is_some() {
+            return Ok(true);
+        }
+        Ok(!self.releases()?.is_empty())
+    }
+
+    /// The Cargo.toml files git tracks in the checkout, wherever they are, so that none in a directory git ignores,
+    /// e.g. a build's, is taken for one of the repository's.
+    pub fn tracked_manifests(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .git(&["ls-files", "--", "Cargo.toml", "*/Cargo.toml"])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| self.dir.join(line))
+            .collect())
+    }
+
+    /// Every crate of the repository, in its workspace or not, see Manifests::read_all, and the Cargo.toml files which
+    /// could not be read, and why.
+    pub fn all_manifests(&self) -> Result<(Manifests, Vec<String>)> {
+        Manifests::read_all(&self.dir, &self.tracked_manifests()?)
+            .with_context(|| format!("{}: could not read its Cargo.toml files", self.name))
     }
 
     /// The branch checked out, or None if none is, e.g. a tag.

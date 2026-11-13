@@ -38,6 +38,33 @@ impl Crate {
     pub fn dir(&self) -> &Path {
         self.manifest.parent().unwrap_or(Path::new("."))
     }
+
+    /// The target the crate is built for, if its own `.cargo/config.toml` sets one, e.g. `xtensa-esp32s3-espidf` for
+    /// a board's firmware. Such a crate is built for a device, so its tests cannot run on this computer, and running
+    /// them would use its runner, which may flash a board.
+    pub fn build_target(&self) -> Result<Option<String>> {
+        for name in ["config.toml", "config"] {
+            let file = self.dir().join(".cargo").join(name);
+            if !file.exists() {
+                continue;
+            }
+            let text = fs::read_to_string(&file).with_context(|| format!("could not read {}", file.display()))?;
+            let config: DocumentMut = text
+                .parse()
+                .with_context(|| format!("could not parse {}", file.display()))?;
+            return Ok(config
+                .get("build")
+                .and_then(|build| build.get("target"))
+                .and_then(|target| target.as_str())
+                .map(str::to_string));
+        }
+        Ok(None)
+    }
+
+    /// Whether the crate is built for a device, see build_target.
+    pub fn for_device(&self) -> Result<bool> {
+        Ok(self.build_target()?.is_some())
+    }
 }
 
 /// A dependency of a crate, by the name of the crate depended on, not any name it is renamed to.
@@ -48,6 +75,8 @@ pub struct Dependency {
     pub requirement: String,
     /// Whether it is a path dependency, e.g. on another crate of the same workspace.
     pub by_path: bool,
+    /// The directory of the crate depended on, for a path dependency.
+    pub path: Option<PathBuf>,
 }
 
 /// The crates of a repository, and what it releases.
@@ -61,37 +90,50 @@ impl Manifests {
     /// Reads the crates of the workspace whose root is in `dir`, without resolving any dependencies, so that it works
     /// whether or not they can be found.
     pub fn read(dir: &Path) -> Result<Manifests> {
-        let json = process::output(dir, "cargo", &["metadata", "--format-version", "1", "--no-deps"])?;
-        let metadata: Metadata = serde_json::from_str(&json).context("could not read cargo metadata's output")?;
-        let kind = kind_of(&metadata.metadata)
-            .or_else(|| metadata.packages.iter().find_map(|package| kind_of(&package.metadata)))
-            .transpose()?
-            .unwrap_or(Kind::Crate);
-        let crates = metadata
-            .packages
-            .into_iter()
-            .map(|package| {
-                Ok(Crate {
-                    version: package
-                        .version
-                        .parse()
-                        .map_err(|error| anyhow!("crate {}: {error}", package.name))?,
-                    publishable: package.publish.is_none_or(|registries| !registries.is_empty()),
-                    dependencies: package
-                        .dependencies
-                        .into_iter()
-                        .map(|dependency| Dependency {
-                            name: dependency.name,
-                            requirement: dependency.req,
-                            by_path: dependency.path.is_some(),
-                        })
-                        .collect(),
-                    name: package.name,
-                    manifest: package.manifest_path,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Manifests { crates, kind })
+        let (crates, kind) = read_metadata(dir, None)?;
+        Ok(Manifests {
+            crates,
+            kind: kind.unwrap_or(Kind::Crate),
+        })
+    }
+
+    /// Reads every crate of the repository in `dir` whose Cargo.toml is one of `files`, its tracked Cargo.toml files,
+    /// whether or not it is in the workspace at the root, e.g. firmware built on its own, or a repository with no
+    /// Cargo.toml at its root, whose crates are each their own workspace. Says too which files could not be read, and
+    /// why, rather than failing, as a crate which cannot be read should not hide the others.
+    pub fn read_all(dir: &Path, files: &[PathBuf]) -> Result<(Manifests, Vec<String>)> {
+        let mut crates: Vec<Crate> = Vec::new();
+        let mut kind = None;
+        let mut unreadable = Vec::new();
+        let root = dir.join("Cargo.toml");
+        let mut files: Vec<&PathBuf> = files.iter().collect();
+        // The root's first, which gives the repository's kind, and covers its workspace's members at once.
+        files.sort_by_key(|file| !same_file(file, &root));
+        for file in files {
+            if crates.iter().any(|krate| same_file(&krate.manifest, file)) {
+                continue;
+            }
+            match read_metadata(dir, Some(file)) {
+                Ok((found, found_kind)) => {
+                    if same_file(file, &root) {
+                        kind = found_kind;
+                    }
+                    for krate in found {
+                        if !crates.iter().any(|known| same_file(&known.manifest, &krate.manifest)) {
+                            crates.push(krate);
+                        }
+                    }
+                }
+                Err(error) => unreadable.push(format!("{}: {error:#}", file.display())),
+            }
+        }
+        Ok((
+            Manifests {
+                crates,
+                kind: kind.unwrap_or(Kind::Crate),
+            },
+            unreadable,
+        ))
     }
 
     /// The repository's version, which every one of its crates has.
@@ -150,6 +192,47 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// The crates of a workspace, from `cargo metadata`, run in `dir`, of the workspace whose Cargo.toml is `manifest`, or
+/// else the one at `dir`'s root, and its kind, if its metadata gives one.
+fn read_metadata(dir: &Path, manifest: Option<&Path>) -> Result<(Vec<Crate>, Option<Kind>)> {
+    let mut args = vec!["metadata", "--format-version", "1", "--no-deps"];
+    let manifest = manifest.map(|manifest| manifest.to_string_lossy().into_owned());
+    if let Some(manifest) = &manifest {
+        args.extend(["--manifest-path", manifest.as_str()]);
+    }
+    let json = process::output(dir, "cargo", &args)?;
+    let metadata: Metadata = serde_json::from_str(&json).context("could not read cargo metadata's output")?;
+    let kind = kind_of(&metadata.metadata)
+        .or_else(|| metadata.packages.iter().find_map(|package| kind_of(&package.metadata)))
+        .transpose()?;
+    let crates = metadata
+        .packages
+        .into_iter()
+        .map(|package| {
+            Ok(Crate {
+                version: package
+                    .version
+                    .parse()
+                    .map_err(|error| anyhow!("crate {}: {error}", package.name))?,
+                publishable: package.publish.is_none_or(|registries| !registries.is_empty()),
+                dependencies: package
+                    .dependencies
+                    .into_iter()
+                    .map(|dependency| Dependency {
+                        name: dependency.name,
+                        requirement: dependency.req,
+                        by_path: dependency.path.is_some(),
+                        path: dependency.path,
+                    })
+                    .collect(),
+                name: package.name,
+                manifest: package.manifest_path,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((crates, kind))
 }
 
 #[derive(Deserialize)]
@@ -229,10 +312,32 @@ pub fn with_version(text: &str, version: Version) -> Result<Option<String>> {
 pub fn with_requirements(text: &str, versions: &HashMap<String, Version>) -> Result<(String, Vec<String>)> {
     let mut document: DocumentMut = text.parse().context("could not read the Cargo.toml")?;
     let mut changes = Vec::new();
+    for_each_dependency_table(&mut document, &mut |table| {
+        set_requirements(table, versions, &mut changes)
+    });
+    Ok((document.to_string(), changes))
+}
+
+/// Makes each of the named crates' path dependencies in a Cargo.toml's text a dependency on crates.io, once the
+/// version is published, in every kind of dependency table, as with_requirements: the path is removed, and the version
+/// given is kept, or else, for a path alone, the version published is required, e.g. `{ path = "../bruce-db" }` to
+/// `"0.2.0"`. One requiring a version which the one published does not meet is left as it is. A table left with only
+/// its version becomes that version, so that it reads as one written by hand would.
+/// Returns the new text and what was changed.
+pub fn with_published(text: &str, versions: &HashMap<String, Version>) -> Result<(String, Vec<String>)> {
+    let mut document: DocumentMut = text.parse().context("could not read the Cargo.toml")?;
+    let mut changes = Vec::new();
+    for_each_dependency_table(&mut document, &mut |table| publish_paths(table, versions, &mut changes));
+    Ok((document.to_string(), changes))
+}
+
+/// Calls f with each dependency table of a Cargo.toml: the crate's own, of each kind, the workspace's, and those for
+/// particular targets.
+fn for_each_dependency_table(document: &mut DocumentMut, f: &mut dyn FnMut(&mut dyn TableLike)) {
     let root = document.as_table_mut();
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(table) = root.get_mut(key).and_then(Item::as_table_like_mut) {
-            set_requirements(table, versions, &mut changes);
+            f(table);
         }
     }
     if let Some(table) = root
@@ -241,7 +346,7 @@ pub fn with_requirements(text: &str, versions: &HashMap<String, Version>) -> Res
         .and_then(|workspace| workspace.get_mut("dependencies"))
         .and_then(Item::as_table_like_mut)
     {
-        set_requirements(table, versions, &mut changes);
+        f(table);
     }
     if let Some(targets) = root.get_mut("target").and_then(Item::as_table_like_mut) {
         for (_, target) in targets.iter_mut() {
@@ -251,12 +356,56 @@ pub fn with_requirements(text: &str, versions: &HashMap<String, Version>) -> Res
                     .and_then(|target| target.get_mut(key))
                     .and_then(Item::as_table_like_mut)
                 {
-                    set_requirements(table, versions, &mut changes);
+                    f(table);
                 }
             }
         }
     }
-    Ok((document.to_string(), changes))
+}
+
+/// Makes the named crates' path dependencies in one dependency table dependencies on crates.io, see with_published.
+fn publish_paths(table: &mut dyn TableLike, versions: &HashMap<String, Version>, changes: &mut Vec<String>) {
+    for (key, item) in table.iter_mut() {
+        let Some(dependency) = item.as_table_like_mut() else {
+            continue;
+        };
+        let name = dependency
+            .get("package")
+            .and_then(Item::as_str)
+            .unwrap_or(key.get())
+            .to_string();
+        let Some(version) = versions.get(&name) else { continue };
+        // A version required which the one published does not meet is left by path, as crates.io cannot give it.
+        if !dependency.contains_key("path")
+            || dependency
+                .get("version")
+                .and_then(Item::as_str)
+                .is_some_and(|required| version.satisfies(required) != Some(true))
+        {
+            continue;
+        }
+        dependency.remove("path");
+        let required = match dependency.get("version").and_then(Item::as_str) {
+            Some(required) => required.to_string(),
+            None => {
+                dependency.insert("version", toml_edit::value(version.to_string()));
+                version.to_string()
+            }
+        };
+        changes.push(format!("{name} from its checkout to \"{required}\" from crates.io"));
+        // An inline table of the version alone becomes the version, keeping the spaces and comments around it, and
+        // one with more is laid out afresh, as removing the path leaves the spaces around it.
+        if let Item::Value(Value::InlineTable(inline)) = item {
+            if inline.len() == 1 {
+                let decor = inline.decor().clone();
+                let mut plain = Value::from(required);
+                *plain.decor_mut() = decor;
+                *item = Item::Value(plain);
+            } else {
+                inline.fmt();
+            }
+        }
+    }
 }
 
 /// Sets the version required of each named crate in one dependency table.
@@ -309,6 +458,22 @@ pub fn set_version(file: &Path, version: Version) -> Result<Option<Change>> {
     }
 }
 
+/// Makes the named crates' path dependencies in a Cargo.toml file dependencies on crates.io, see with_published.
+pub fn publish_paths_in(file: &Path, versions: &HashMap<String, Version>) -> Result<Vec<Change>> {
+    let text = fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()))?;
+    let (new, changes) = with_published(&text, versions).with_context(|| file.display().to_string())?;
+    if new != text {
+        fs::write(file, new).with_context(|| format!("could not write {}", file.display()))?;
+    }
+    Ok(changes
+        .into_iter()
+        .map(|what| Change {
+            file: file.to_path_buf(),
+            what,
+        })
+        .collect())
+}
+
 /// Sets the versions required of the named crates in a Cargo.toml file, see with_requirements.
 pub fn set_requirements_in(file: &Path, versions: &HashMap<String, Version>) -> Result<Vec<Change>> {
     let text = fs::read_to_string(file).with_context(|| format!("could not read {}", file.display()))?;
@@ -334,6 +499,51 @@ mod tests {
             .iter()
             .map(|(name, version)| (name.to_string(), version.parse().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn makes_path_dependencies_published_ones() {
+        let text = "[dependencies]\n\
+                    # The store.\n\
+                    bruce-db = { version = \"0.2.0\", path = \"../bruce-db\" } # local\n\
+                    std = { path = \"../bruce-embedded-std\", features = [\"x\"] }\n\
+                    other = { path = \"other\" }\n\
+                    newer = { package = \"bruce-db\", version = \"0.3.0\", path = \"../bruce-db\" }\n\
+                    \n\
+                    [target.'cfg(unix)'.dependencies.progress]\n\
+                    package = \"bruce-util-progress\"\n\
+                    path = \"../progress\"\n";
+        let (new, changes) = with_published(
+            text,
+            &versions(&[
+                ("bruce-db", "0.2.0"),
+                ("bruce-embedded-std", "0.1.0"),
+                ("std", "9.9.9"),
+                ("bruce-util-progress", "0.3.0"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            new,
+            "[dependencies]\n\
+             # The store.\n\
+             bruce-db = \"0.2.0\" # local\n\
+             std = { features = [\"x\"], version = \"9.9.9\" }\n\
+             other = { path = \"other\" }\n\
+             newer = { package = \"bruce-db\", version = \"0.3.0\", path = \"../bruce-db\" }\n\
+             \n\
+             [target.'cfg(unix)'.dependencies.progress]\n\
+             package = \"bruce-util-progress\"\n\
+             version = \"0.3.0\"\n"
+        );
+        assert_eq!(
+            changes,
+            vec![
+                "bruce-db from its checkout to \"0.2.0\" from crates.io",
+                "std from its checkout to \"9.9.9\" from crates.io",
+                "bruce-util-progress from its checkout to \"0.3.0\" from crates.io",
+            ]
+        );
     }
 
     #[test]
