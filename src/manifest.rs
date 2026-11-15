@@ -394,7 +394,8 @@ fn publish_paths(table: &mut dyn TableLike, versions: &HashMap<String, Version>,
         };
         changes.push(format!("{name} from its checkout to \"{required}\" from crates.io"));
         // An inline table of the version alone becomes the version, keeping the spaces and comments around it, and
-        // one with more is laid out afresh, as removing the path leaves the spaces around it.
+        // one with more is laid out afresh, as removing the path leaves the spaces around it, with the version first,
+        // after the package if it is renamed, as Cargo.toml files usually have it, rather than last, where it was added.
         if let Item::Value(Value::InlineTable(inline)) = item {
             if inline.len() == 1 {
                 let decor = inline.decor().clone();
@@ -402,7 +403,20 @@ fn publish_paths(table: &mut dyn TableLike, versions: &HashMap<String, Version>,
                 *plain.decor_mut() = decor;
                 *item = Item::Value(plain);
             } else {
-                inline.fmt();
+                let mut ordered = toml_edit::InlineTable::new();
+                for first in ["package", "version"] {
+                    if let Some(value) = inline.get(first) {
+                        ordered.insert(first, value.clone());
+                    }
+                }
+                for (key, value) in inline.iter() {
+                    if key != "package" && key != "version" {
+                        ordered.insert(key, value.clone());
+                    }
+                }
+                *ordered.decor_mut() = inline.decor().clone();
+                ordered.fmt();
+                *inline = ordered;
             }
         }
     }
@@ -528,7 +542,7 @@ mod tests {
             "[dependencies]\n\
              # The store.\n\
              bruce-db = \"0.2.0\" # local\n\
-             std = { features = [\"x\"], version = \"9.9.9\" }\n\
+             std = { version = \"9.9.9\", features = [\"x\"] }\n\
              other = { path = \"other\" }\n\
              newer = { package = \"bruce-db\", version = \"0.3.0\", path = \"../bruce-db\" }\n\
              \n\
