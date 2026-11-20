@@ -1,6 +1,6 @@
   {{job}}:
     name: Build the iOS app, {{scheme}}
-    runs-on: macos-latest
+    runs-on: {{runner}}{{xcode}}
     steps:
 {{setup_steps}}
 
@@ -12,6 +12,7 @@
           API_KEY: ${{ secrets.APPLE_API_KEY }}
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
+          xcodebuild -version
           xcodebuild archive \
             -project "{{project}}" \
             -scheme "{{scheme}}" \

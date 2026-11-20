@@ -349,6 +349,14 @@ pub enum StoreApp {
         /// A Swift package of its, from the repository's root, whose tests CI runs, e.g. `ios/QuizPartyKit`.
         #[serde(default, rename = "swift-package")]
         swift_package: Option<String>,
+        /// The GitHub runner which builds it, e.g. `xcode-27`, the image with the newest Xcode while `macos-latest`
+        /// does not have it yet; `macos-latest` unless set.
+        #[serde(default)]
+        runner: Option<String>,
+        /// The Xcode which builds it, from those on the runner, e.g. `27.2`, for the SDK App Store Connect asks for,
+        /// as `/Applications/Xcode_27.2.app`; the runner's default unless set.
+        #[serde(default)]
+        xcode: Option<String>,
     },
     /// A Mac app made with Dioxus, which the workflow puts in an Xcode archive to sign and upload.
     Macos {
@@ -366,6 +374,12 @@ pub enum StoreApp {
         /// does not ask. It is false unless set, as it is a declaration only the app's author can make.
         #[serde(default, rename = "exempt-encryption")]
         exempt_encryption: bool,
+        /// The app's name, as people see it, e.g. `Bruce's Quiz Party`, given to its bundle, in Finder and the menu
+        /// bar, and, without spaces or punctuation, to the package exported, e.g. `BrucesQuizParty.pkg`. Without it,
+        /// the app keeps the name dx gives it, its binary's in PascalCase, e.g. `BruceQuizParty`, which Dioxus.toml
+        /// cannot change.
+        #[serde(default)]
+        name: Option<String>,
     },
 }
 

@@ -278,6 +278,8 @@ platform = "ios"
 project = "ios/MyApp.xcodeproj"
 scheme = "MyApp"
 swift-package = "ios/MyAppKit"   # optional: a Swift package whose tests CI runs
+runner = "xcode-27"              # optional: the GitHub runner, e.g. one with a newer Xcode; macos-latest by default
+xcode = "27.2"                   # optional: the Xcode on it to build with; the runner's default otherwise
 
 [[workspace.metadata.bruce-method.apps]]
 platform = "macos"
@@ -286,6 +288,7 @@ features = ["store"]             # optional: the App Store build's Cargo feature
 entitlements = "server/store.entitlements"
 category = "public.app-category.trivia-games"
 exempt-encryption = true         # optional: its only encryption is exempt, e.g. HTTPS through Apple's frameworks
+name = "Bruce's Quiz Party"      # optional: its name in Finder and the menu bar, instead of dx's, e.g. BruceQuizParty
 ```
 
 `setup` makes its release workflow, which builds each app on a GitHub Mac and signs it for App Store Connect, with

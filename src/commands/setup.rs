@@ -346,11 +346,16 @@ fn comment(text: &str) -> String {
 pub fn render(template: &str, values: &[(&str, &str)]) -> Result<String> {
     let mut text = template.to_string();
     for (name, value) in values {
-        // A value which is empty leaves no blank line where it was on a line of its own.
+        let placeholder = format!("{{{{{name}}}}}");
+        // A value which is empty leaves no blank line where it was on a line of its own; at the end of a line with
+        // more on it, the line stays.
         if value.is_empty() {
-            text = text.replace(&format!("{{{{{name}}}}}\n"), "");
+            text = text
+                .split_inclusive('\n')
+                .filter(|line| line.trim() != placeholder)
+                .collect();
         }
-        text = text.replace(&format!("{{{{{name}}}}}"), value);
+        text = text.replace(&placeholder, value);
     }
     if let Some(start) = text.find("{{")
         && text[start + 2..].starts_with(|c: char| c.is_ascii_lowercase())
@@ -465,18 +470,30 @@ fn app_store_release(repo: &Repo, settings: &StoreSettings, header: &str) -> Res
             format!("{platform}-{}", count + 1)
         };
         used.push(job.clone());
-        let export = |what: &str| {
-            render(STORE_EXPORT_STEPS, &[("what", what), ("artifact", &job)]).map(|text| text.trim_end().to_string())
+        let export = |what: &str, after_export: &str| {
+            render(
+                STORE_EXPORT_STEPS,
+                &[("what", what), ("artifact", &job), ("after_export", after_export)],
+            )
+            .map(|text| text.trim_end().to_string())
         };
         let rendered = match app {
-            StoreApp::Ios { project, scheme, .. } => render(
+            StoreApp::Ios {
+                project,
+                scheme,
+                runner,
+                xcode,
+                ..
+            } => render(
                 STORE_JOB_IOS,
                 &[
                     ("job", &job),
+                    ("runner", runner.as_deref().unwrap_or("macos-latest")),
+                    ("xcode", &xcode_env(xcode.as_deref())?),
                     ("project", project),
                     ("scheme", scheme),
                     ("setup_steps", setup_steps),
-                    ("export_steps", &export("the iOS app")?),
+                    ("export_steps", &export("the iOS app", "")?),
                 ],
             )?,
             StoreApp::Macos {
@@ -485,6 +502,7 @@ fn app_store_release(repo: &Repo, settings: &StoreSettings, header: &str) -> Res
                 entitlements,
                 category,
                 exempt_encryption,
+                name,
             } => {
                 if !repo.dir.join(dioxus).join("Dioxus.toml").exists() {
                     bail!("{} has no Dioxus.toml in {dioxus}, the Mac app's folder", repo.name);
@@ -504,6 +522,10 @@ fn app_store_release(repo: &Repo, settings: &StoreSettings, header: &str) -> Res
                 } else {
                     ""
                 };
+                let (rename, names, after_export) = match name {
+                    Some(name) => renamed(name)?,
+                    None => Default::default(),
+                };
                 render(
                     STORE_JOB_MACOS,
                     &[
@@ -514,8 +536,10 @@ fn app_store_release(repo: &Repo, settings: &StoreSettings, header: &str) -> Res
                         ("entitlements", entitlements),
                         ("category", category),
                         ("encryption", encryption),
+                        ("rename", &rename),
+                        ("names", &names),
                         ("setup_steps", setup_steps),
-                        ("export_steps", &export("the Mac app")?),
+                        ("export_steps", &export("the Mac app", &after_export)?),
                     ],
                 )?
             }
@@ -536,6 +560,48 @@ fn app_store_release(repo: &Repo, settings: &StoreSettings, header: &str) -> Res
             ),
         ],
     )
+}
+
+/// The job's environment choosing an Xcode on the runner, e.g. `27.2`, by its folder, `/Applications/Xcode_27.2.app`,
+/// which xcodebuild uses through DEVELOPER_DIR; none, for the runner's default, when no Xcode is given.
+fn xcode_env(xcode: Option<&str>) -> Result<String> {
+    let Some(xcode) = xcode else {
+        return Ok(String::new());
+    };
+    if xcode.is_empty() || !xcode.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        bail!("the iOS app's xcode, {xcode:?}, should be a version, e.g. 27.2");
+    }
+    Ok(format!(
+        "\n    env:\n      DEVELOPER_DIR: /Applications/Xcode_{xcode}.app/Contents/Developer"
+    ))
+}
+
+/// The Mac app's job's lines for giving it a name, e.g. `Bruce's Quiz Party`: renaming the bundle dx built, setting the
+/// name in its Info.plist, and naming the package exported after it, without spaces or punctuation, e.g.
+/// `BrucesQuizParty.pkg`, which an upload has none of.
+fn renamed(name: &str) -> Result<(String, String, String)> {
+    let file: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
+    if file.is_empty() || name.contains(['/', ':']) || name.chars().any(char::is_control) {
+        bail!("the Mac app's name, {name:?}, cannot name a file: give it letters or digits, and no / or :");
+    }
+    // In double quotes in the shell, where only these are special.
+    let quoted: String = name
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '\\' | '$' | '`' => vec!['\\', c],
+            c => vec![c],
+        })
+        .collect();
+    let rename = format!(
+        "\n          renamed=\"$(dirname \"$app\")/{quoted}.app\"\n          mv \"$app\" \"$renamed\"\n          app=\"$renamed\""
+    );
+    let names = format!(
+        "\n          plutil -replace CFBundleName -string \"{quoted}\" \"$info\"\n          plutil -replace CFBundleDisplayName -string \"{quoted}\" \"$info\""
+    );
+    let after_export = format!(
+        "\n          for package in \"$RUNNER_TEMP\"/dist/*.pkg; do\n            [ -e \"$package\" ] && mv \"$package\" \"$RUNNER_TEMP/dist/{file}.pkg\"\n          done"
+    );
+    Ok((rename, names, after_export))
 }
 
 /// An App Store repository's CI: Rust's tests and the iOS apps' Swift packages', on a Mac, and cargo-deny's checks.
@@ -722,5 +788,35 @@ mod tests {
         fs::write(&path, "[licenses]\nexceptions = []\n").unwrap();
         assert_eq!(kept(&path, &APPROVALS).unwrap(), "");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_the_mac_app() {
+        let (rename, names, after_export) = super::renamed("Bruce's \"Quiz\" $Party").unwrap();
+        assert!(rename.contains(r#"/Bruce's \"Quiz\" \$Party.app""#), "{rename}");
+        assert!(
+            names.contains(r#"CFBundleDisplayName -string "Bruce's \"Quiz\" \$Party""#),
+            "{names}"
+        );
+        assert!(after_export.contains("/dist/BrucesQuizParty.pkg"), "{after_export}");
+        assert!(super::renamed("a/b").is_err());
+        assert!(super::renamed("'!").is_err());
+    }
+
+    #[test]
+    fn an_empty_value_removes_only_a_line_of_its_own() {
+        let text = super::render("a\n    {{x}}\nb{{x}}\nc\n", &[("x", "")]).unwrap();
+        assert_eq!(text, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn chooses_the_xcode() {
+        assert_eq!(super::xcode_env(None).unwrap(), "");
+        assert!(
+            super::xcode_env(Some("27.2"))
+                .unwrap()
+                .ends_with("DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer")
+        );
+        assert!(super::xcode_env(Some("27.2; rm")).is_err());
     }
 }

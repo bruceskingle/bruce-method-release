@@ -21,7 +21,7 @@
             -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$API_KEY" \
-            -authenticationKeyIssuerID "$API_ISSUER"
+            -authenticationKeyIssuerID "$API_ISSUER"{{after_export}}
           ls -l "$RUNNER_TEMP/dist"
 
       - name: Keep {{what}}

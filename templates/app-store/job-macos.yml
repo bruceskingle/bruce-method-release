@@ -36,21 +36,21 @@
         working-directory: {{dioxus}}
         run: dx build --release --platform desktop{{features}}
 
-      # The App Store's version, build number, category, oldest macOS and, if exempt, its encryption in its Info.plist,
-      # and its icon, which dx build names there but, unlike dx bundle, does not copy in: the .icns among the icons in
-      # Dioxus.toml. Then it is signed here, without a certificate, only to carry its entitlements, e.g. the App
-      # Sandbox's, which the export keeps when it signs it for the store.
+      # The app's name, if it is given one, and the App Store's version, build number, category, oldest macOS and, if
+      # exempt, its encryption in its Info.plist, and its icon, which dx build names there but, unlike dx bundle, does
+      # not copy in: the .icns among the icons in Dioxus.toml. Then it is signed here, without a certificate, only to
+      # carry its entitlements, e.g. the App Sandbox's, which the export keeps when it signs it for the store.
       - name: Prepare the app
         run: |
           app=$(find target/dx -path '*/release/macos/*.app' -maxdepth 5 -type d | head -1)
           if [ -z "$app" ]; then
             echo "The app was not built"
             exit 1
-          fi
+          fi{{rename}}
           info="$app/Contents/Info.plist"
           plutil -replace CFBundleShortVersionString -string "$VERSION" "$info"
           plutil -replace CFBundleVersion -string "$BUILD" "$info"
-          plutil -replace LSApplicationCategoryType -string "{{category}}" "$info"{{encryption}}
+          plutil -replace LSApplicationCategoryType -string "{{category}}" "$info"{{encryption}}{{names}}
           plutil -replace LSMinimumSystemVersion -string "$MACOSX_DEPLOYMENT_TARGET" "$info"
           icon=$(grep -o '"[^"]*\.icns"' "{{dioxus}}/Dioxus.toml" | head -1 | tr -d '"')
           if [ -z "$icon" ]; then
