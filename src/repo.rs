@@ -186,6 +186,23 @@ impl Repo {
             .is_empty())
     }
 
+    /// The commit a tag on GitHub names, asking GitHub, or None if it is not there.
+    pub fn remote_tag_commit(&self, tag: &str) -> Result<Option<String>> {
+        let lines = self.git(&[
+            "ls-remote",
+            "--tags",
+            "origin",
+            &format!("refs/tags/{tag}"),
+            &format!("refs/tags/{tag}^{{}}"),
+        ])?;
+        // An annotated tag's commit is on its ^{} line, which comes after the tag's own.
+        Ok(lines
+            .lines()
+            .last()
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_string))
+    }
+
     /// The commit a ref names.
     pub fn commit(&self, name: &str) -> Result<String> {
         self.git(&["rev-parse", &format!("{name}^{{commit}}")])

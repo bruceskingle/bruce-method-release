@@ -136,7 +136,7 @@ part way, e.g. at a network failure, carries on from where it stopped when run a
 | `release` | The checks, then the squash merge to `main` by pull request, the tag, publishing from the tag, the GitHub release, the unlinks next to it, and `start` of the next version. The repositories next to it which link the version released are unlinked, and those which take its crates by path, e.g. `{ version = "0.1.0", path = "../lib" }` or a path alone, take that version from crates.io instead, as its checkout moves on to the next version. One requiring a version which the release does not meet is left by path. |
 | `try` | For an app: builds the installers of the branch's last commit with its workflow, and downloads them, releasing nothing; see [Apps](#apps). |
 | `watch` | For an app: watches its workflow's latest run, of a `try` or a `release`, e.g. after Ctrl+C, and downloads the installers. |
-| `download` | For an app: downloads the installer for this computer from the latest run, e.g. to try it on another computer. |
+| `download` | For an app: downloads the installer for this computer from the latest run, e.g. to try it on another computer. Not for the App Store's, which are installed from TestFlight. |
 | `untag` | For an app: deletes the draft release and the release's tag, to make more changes before publishing. |
 | `setup` | Makes the repository's workflows and standard files from the method's templates, keeps them so, and sets its GitHub settings as the method wants them; see [Setup](#setup). |
 | `link <library>` | Links this repository to the library's checkout next to it. |
@@ -291,9 +291,24 @@ exempt-encryption = true         # optional: its only encryption is exempt, e.g.
 `setup` makes its release workflow, which builds each app on a GitHub Mac and signs it for App Store Connect, with
 automatic signing and an App Store Connect API key with the Admin role, so that no certificate or profile is kept in
 the repository's secrets; a Mac app made with Dioxus is put in an Xcode archive of its own, signed with its
-entitlements, for xcodebuild to export as it would one of Xcode's. With `upload` it uploads them, where they appear in
-TestFlight; submitting one for App Review is done in App Store Connect. Its CI runs on a Mac, with the iOS apps' Swift
-packages' tests. `try` and `release` do not drive it yet: run it from the Actions tab.
+entitlements, for xcodebuild to export as it would one of Xcode's. Pushing a tag runs it, so that it works before it is
+on main, where the Actions tab could run it: a `testX.Y.Z` tag builds and signs the apps without uploading them, and a
+`releaseX.Y.Z` tag uploads them to App Store Connect, where they appear in TestFlight once Apple has processed them. Its
+CI runs on a Mac, with the iOS apps' Swift packages' tests.
+
+Its release goes as an app's does, but with TestFlight in place of a draft's installers:
+
+1. `try` tags the branch's last commit `testX.Y.Z` and pushes the tag, which builds the apps and signs them as they
+   would be uploaded, then downloads them to `~/Downloads/<repo>-X.Y.Z-test`. A successful try is also the CI run the
+   release checks for. It builds with the libraries from crates.io, so unlink any first.
+2. `release` checks, squash merges into main, tags main `releaseX.Y.Z`, which uploads the apps, makes a draft GitHub
+   release with the ChangeLog's notes, watches the upload, and stops.
+3. Try the apps in TestFlight, and submit them for App Review in App Store Connect.
+4. Once Apple has approved them, `release` again publishes the GitHub release and starts the next version. Until then,
+   a rejection is fixed in the same version, as in the next paragraph.
+
+To change something after step 2, `untag`, commit the change, `try` it, and `release` again: the next upload has a new
+build number, the workflow's run number, which App Store Connect needs. A failed upload is run again by `release`.
 
 Firmware, which attaches the builds for each board, is to follow.
 

@@ -9,4 +9,5 @@ pub mod release;
 pub mod setup;
 pub mod start;
 pub mod status;
+pub mod store;
 pub mod sync;

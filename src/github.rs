@@ -118,7 +118,7 @@ pub fn start_workflow(
     inputs: &[(&str, &str)],
     ui: &mut dyn Ui,
 ) -> Result<Run> {
-    let previous = runs(repo, workflow, Some(from), 1)?.first().map(|run| run.id);
+    let previous = latest_run_id(repo, workflow, from)?;
     ui.info(&format!("{}: starting the {workflow} workflow from {from}", repo.name));
     let fields: Vec<String> = inputs.iter().map(|(name, value)| format!("{name}={value}")).collect();
     let mut args = vec!["workflow", "run", workflow, "--ref", from];
@@ -126,7 +126,18 @@ pub fn start_workflow(
         args.extend(["--field", field]);
     }
     process::output(&repo.dir, "gh", &args)?;
-    // GitHub lists the run a few seconds after it is asked for.
+    wait_for_run(repo, workflow, from, previous)
+}
+
+/// The latest run of a workflow from a branch or tag, if any, by its ID, to tell a new one from it.
+pub fn latest_run_id(repo: &Repo, workflow: &str, from: &str) -> Result<Option<u64>> {
+    Ok(runs(repo, workflow, Some(from), 1)?.first().map(|run| run.id))
+}
+
+/// Waits for a new run of a workflow from a branch or tag, other than `previous`, the latest before it was started,
+/// e.g. by `start_workflow`, or by pushing a tag which the workflow runs on, and returns it once GitHub lists it.
+pub fn wait_for_run(repo: &Repo, workflow: &str, from: &str, previous: Option<u64>) -> Result<Run> {
+    // GitHub lists the run a few seconds after it is started.
     for _ in 0..30 {
         thread::sleep(Duration::from_secs(2));
         if let Some(run) = runs(repo, workflow, Some(from), 1)?.into_iter().next()
@@ -136,6 +147,15 @@ pub fn start_workflow(
         }
     }
     bail!("the {workflow} run from {from} did not start, see the repository's Actions tab on GitHub")
+}
+
+/// Runs a run's failed jobs again, keeping its ID, so that it can be watched again.
+pub fn rerun_failed(repo: &Repo, run: &Run, ui: &mut dyn Ui) -> Result<()> {
+    ui.info(&format!(
+        "{}: running the failed jobs of run {} again",
+        repo.name, run.id
+    ));
+    process::output(&repo.dir, "gh", &["run", "rerun", &run.id.to_string(), "--failed"]).map(|_| ())
 }
 
 /// Shows a run's progress until it finishes, failing, with how to see why, if it did not succeed. Stopping the tool,

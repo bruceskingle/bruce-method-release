@@ -9,6 +9,7 @@ use crate::commands::app;
 use crate::commands::check::{self, Outcome};
 use crate::commands::link;
 use crate::commands::start::{self, StartPlan};
+use crate::commands::store;
 use crate::links;
 use crate::manifest::{Crate, Kind, Manifests};
 use crate::notes;
@@ -41,10 +42,7 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
         return app::release(repo, ui);
     }
     if manifests.kind == Kind::AppStore {
-        bail!(
-            "{} releases to the App Store, which this tool does not do yet: run its workflow from the Actions tab",
-            repo.name
-        );
+        return store::release(repo, ui);
     }
     let version = manifests.version()?;
     let branch = version.branch();

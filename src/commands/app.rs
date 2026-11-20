@@ -27,12 +27,10 @@ struct App {
 impl App {
     fn of(repo: &Repo) -> Result<App> {
         let settings = manifest::app_settings(&repo.dir).with_context(|| format!("{} is not an app", repo.name))?;
-        let version = repo.manifests()?.version()?;
-        let branch = version.branch();
-        if repo.branch()?.as_deref() != Some(branch.as_str()) {
-            bail!("{} is not on {branch}, the branch of its version, {version}", repo.name);
-        }
-        Ok(App { settings, version })
+        Ok(App {
+            settings,
+            version: version_on_branch(repo)?,
+        })
     }
 
     /// The installers missing from the draft release, by file name.
@@ -56,6 +54,16 @@ impl App {
             .find(|installer| installer.platform == platform)
             .ok_or_else(|| anyhow::anyhow!("there is no installer for {platform}, this computer"))
     }
+}
+
+/// The version of the repository, after checking that it is on the version's branch.
+pub(crate) fn version_on_branch(repo: &Repo) -> Result<Version> {
+    let version = repo.manifests()?.version()?;
+    let branch = version.branch();
+    if repo.branch()?.as_deref() != Some(branch.as_str()) {
+        bail!("{} is not on {branch}, the branch of its version, {version}", repo.name);
+    }
+    Ok(version)
 }
 
 /// Where a version's installers are downloaded to, in the Downloads folder: `<repo>-<version>-test` for those of a
@@ -99,7 +107,7 @@ pub fn this_platform() -> Result<String> {
 
 /// Checks that what is on the branch can be built by the workflow: committed, pushed, and taking nothing by path from
 /// outside the repository. Linked libraries are checked by linked_for_try.
-fn require_buildable(repo: &Repo, manifests: &Manifests) -> Result<()> {
+pub(crate) fn require_buildable(repo: &Repo, manifests: &Manifests) -> Result<()> {
     repo.require_clean()?;
     match repo.ahead_behind()? {
         Some((0, 0)) => {}
@@ -244,7 +252,7 @@ pub fn try_installers(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
 }
 
 /// Downloads every installer a try built.
-fn download_tried(repo: &Repo, run: &Run, dir: &PathBuf, ui: &mut dyn Ui) -> Result<()> {
+fn download_tried(repo: &Repo, run: &Run, dir: &std::path::Path, ui: &mut dyn Ui) -> Result<()> {
     remove_dir(dir)?;
     github::download_run(repo, run, None, dir)?;
     ui.info(&format!("The installers are in {}", dir.display()));
@@ -269,7 +277,7 @@ fn download_drafted(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()
     Ok(())
 }
 
-fn remove_dir(dir: &PathBuf) -> Result<()> {
+pub(crate) fn remove_dir(dir: &std::path::Path) -> Result<()> {
     if dir.exists() {
         fs::remove_dir_all(dir).with_context(|| format!("could not remove {}", dir.display()))?;
     }
@@ -355,8 +363,8 @@ pub fn download(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
 /// Takes back a release not yet published, to make more changes: deletes the draft release and the release's tag. The
 /// squash merge stays on main, and the next release merges the changes made since.
 pub fn untag(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
-    let app = App::of(repo)?;
-    let tag = app.version.tag();
+    let version = version_on_branch(repo)?;
+    let tag = version.tag();
     repo.fetch()?;
     let state = github::release_state(repo, &tag)?;
     if state == ReleaseState::Published {
@@ -375,7 +383,7 @@ pub fn untag(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
         ui.info(&format!("{} has no draft release or tag {tag} to delete", repo.name));
         return Ok(());
     }
-    if !ui.confirm(&format!("Untag {} {}", repo.name, app.version), &steps)? {
+    if !ui.confirm(&format!("Untag {} {version}", repo.name), &steps)? {
         ui.info("Cancelled, nothing changed");
         return Ok(());
     }
@@ -386,13 +394,13 @@ pub fn untag(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     delete_tag(repo, &tag, ui)?;
     ui.info(&format!(
         "Make the changes on {}, commit and push them, try them, then release again",
-        app.version.branch()
+        version.branch()
     ));
     Ok(())
 }
 
 /// Deletes a tag here and on GitHub, wherever it is.
-fn delete_tag(repo: &Repo, tag: &str, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn delete_tag(repo: &Repo, tag: &str, ui: &mut dyn Ui) -> Result<()> {
     ui.info(&format!("{}: deleting the tag {tag}", repo.name));
     if repo.has_ref(&format!("refs/tags/{tag}"))? {
         repo.git(&["tag", "--delete", tag])?;
@@ -418,56 +426,119 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     }
 }
 
+/// How far the merging and tagging of an app's release has got, which both kinds of app do in the same way: squash
+/// merging the branch into main, tagging main, merging main back, deleting the try's tag, and making the draft GitHub
+/// release, with the ChangeLog's notes.
+pub(crate) struct Merge {
+    version: Version,
+    pub merged: bool,
+    pub tagged: bool,
+    merged_back: bool,
+    tried: bool,
+    state: ReleaseState,
+}
+
+impl Merge {
+    /// Where the release is, after running the checks a release needs if it has not started, failing if one fails.
+    pub(crate) fn of(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<Merge> {
+        let tag = version.tag();
+        let tagged = repo.remote_tag_exists(&tag)?;
+        let merged =
+            tagged || (same_tree(repo, "origin/main", "HEAD")? && release::pull_request_merged(repo, version)?);
+        if merged {
+            ui.info(&format!(
+                "{} {version} is part way through its release, carrying on",
+                repo.name
+            ));
+        } else {
+            let failed: Vec<String> = check::check(repo, ui)?
+                .iter()
+                .filter_map(|check| match &check.outcome {
+                    check::Outcome::Fail(why) => Some(format!("{}: {why}", check.name)),
+                    _ => None,
+                })
+                .collect();
+            if !failed.is_empty() {
+                bail!("{} cannot be released yet:\n{}", repo.name, failed.join("\n"));
+            }
+        }
+        let test_tag = version.test_tag();
+        Ok(Merge {
+            version,
+            merged,
+            tagged,
+            merged_back: merged && is_ancestor(repo, "origin/main", "HEAD")?,
+            tried: repo.has_ref(&format!("refs/tags/{test_tag}"))? || repo.remote_tag_exists(&test_tag)?,
+            state: github::release_state(repo, &tag)?,
+        })
+    }
+
+    /// What it will do, each step marked if it is done; `tagging` says what pushing the tag does too, if anything.
+    pub(crate) fn steps(&self, tagging: &str) -> Vec<String> {
+        let branch = self.version.branch();
+        let tag = self.version.tag();
+        let done = |done: bool| if done { " (done)" } else { "" };
+        let mut steps = vec![
+            format!("Squash merge {branch} into main by pull request{}", done(self.merged)),
+            format!("Tag main {tag}, and push the tag{tagging}{}", done(self.tagged)),
+            format!(
+                "Merge main back into {branch}, which changes no files, so that the next pull request shows only what is new{}",
+                done(self.merged_back)
+            ),
+        ];
+        if self.tried {
+            steps.push(format!("Delete the tag {} of the last try", self.version.test_tag()));
+        }
+        steps.push(format!(
+            "Make the draft GitHub release {tag}, with the ChangeLog's notes{}",
+            done(self.state != ReleaseState::None)
+        ));
+        steps
+    }
+
+    /// Does what is not done yet.
+    pub(crate) fn apply(&self, repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
+        let version = self.version;
+        let branch = version.branch();
+        if !self.merged {
+            release::merge(repo, version, ui)?;
+        }
+        repo.fetch()?;
+        if !self.tagged {
+            release::tag(repo, version, ui)?;
+        }
+        if !is_ancestor(repo, "origin/main", "HEAD")? {
+            ui.info(&format!("{}: merging main back into {branch}", repo.name));
+            repo.git(&[
+                "merge",
+                "--quiet",
+                "--no-edit",
+                "origin/main",
+                "--message",
+                "Merge main after squash merge",
+            ])?;
+            repo.git(&["push", "--quiet"])?;
+        }
+        if self.tried {
+            delete_tag(repo, &version.test_tag(), ui)?;
+        }
+        if self.state == ReleaseState::None {
+            release::github_release(repo, version, true, ui)?;
+        }
+        Ok(())
+    }
+}
+
 /// The first go of an app's release, up to the installers on the draft release.
 fn build(repo: &Repo, app: &App, ui: &mut dyn Ui) -> Result<()> {
     let version = app.version;
-    let branch = version.branch();
     let tag = version.tag();
-    let tagged = repo.remote_tag_exists(&tag)?;
-    let merged = tagged || (same_tree(repo, "origin/main", "HEAD")? && release::pull_request_merged(repo, version)?);
-    let state = github::release_state(repo, &tag)?;
+    let merge = Merge::of(repo, version, ui)?;
     let running = github::runs(repo, &app.settings.workflow, Some(&tag), 1)?
         .into_iter()
         .find(|run| !run.completed());
-
-    if merged {
-        ui.info(&format!(
-            "{} {version} is part way through its release, carrying on",
-            repo.name
-        ));
-    } else {
-        let failed: Vec<String> = check::check(repo, ui)?
-            .iter()
-            .filter_map(|check| match &check.outcome {
-                check::Outcome::Fail(why) => Some(format!("{}: {why}", check.name)),
-                _ => None,
-            })
-            .collect();
-        if !failed.is_empty() {
-            bail!("{} cannot be released yet:\n{}", repo.name, failed.join("\n"));
-        }
-    }
-
-    let merged_back = merged && is_ancestor(repo, "origin/main", "HEAD")?;
-    let test_tag = version.test_tag();
-    let tried = repo.has_ref(&format!("refs/tags/{test_tag}"))? || repo.remote_tag_exists(&test_tag)?;
     let dir = download_dir(repo, version, false)?;
-    let done = |done: bool| if done { " (done)" } else { "" };
-    let mut steps = vec![
-        format!("Squash merge {branch} into main by pull request{}", done(merged)),
-        format!("Tag main {tag}, and push the tag{}", done(tagged)),
-        format!(
-            "Merge main back into {branch}, which changes no files, so that the next pull request shows only what is new{}",
-            done(merged_back)
-        ),
-    ];
-    if tried {
-        steps.push(format!("Delete the tag {test_tag} of the last try"));
-    }
-    steps.push(format!(
-        "Make the draft GitHub release {tag}, with the ChangeLog's notes{}",
-        done(state != ReleaseState::None)
-    ));
+    let mut steps = merge.steps("");
     steps.push(match &running {
         Some(run) => format!("Watch the run already building the installers, {}", run.url),
         None => format!(
@@ -486,32 +557,7 @@ fn build(repo: &Repo, app: &App, ui: &mut dyn Ui) -> Result<()> {
         ui.info("Cancelled, nothing changed");
         return Ok(());
     }
-
-    if !merged {
-        release::merge(repo, version, ui)?;
-    }
-    repo.fetch()?;
-    if !tagged {
-        release::tag(repo, version, ui)?;
-    }
-    if !is_ancestor(repo, "origin/main", "HEAD")? {
-        ui.info(&format!("{}: merging main back into {branch}", repo.name));
-        repo.git(&[
-            "merge",
-            "--quiet",
-            "--no-edit",
-            "origin/main",
-            "--message",
-            "Merge main after squash merge",
-        ])?;
-        repo.git(&["push", "--quiet"])?;
-    }
-    if tried {
-        delete_tag(repo, &test_tag, ui)?;
-    }
-    if state == ReleaseState::None {
-        release::github_release(repo, version, true, ui)?;
-    }
+    merge.apply(repo, ui)?;
     let run = match running {
         Some(run) => run,
         None => github::start_workflow(
@@ -560,7 +606,7 @@ fn publish(repo: &Repo, app: &App, ui: &mut dyn Ui) -> Result<()> {
 }
 
 /// Starts the next version, if a release was published but the next version not started, e.g. as it stopped.
-fn start_next(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn start_next(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
     let Some(next) = next_version(repo, version)? else {
         bail!("{} {version} is already released", repo.name);
     };
@@ -576,7 +622,7 @@ fn start_next(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
 
 /// The next version to start after releasing one, or None for a fix, after which the version being developed carries
 /// on, or if its branch is already there.
-fn next_version(repo: &Repo, version: Version) -> Result<Option<StartPlan>> {
+pub(crate) fn next_version(repo: &Repo, version: Version) -> Result<Option<StartPlan>> {
     if version.fixes().is_some() {
         return Ok(None);
     }
@@ -591,7 +637,7 @@ fn next_version(repo: &Repo, version: Version) -> Result<Option<StartPlan>> {
     }))
 }
 
-fn finish(repo: &Repo, version: Version, next: Option<StartPlan>, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn finish(repo: &Repo, version: Version, next: Option<StartPlan>, ui: &mut dyn Ui) -> Result<()> {
     match &next {
         Some(next) => start::apply_start(repo, next, ui)?,
         None if version.fixes().is_some() => ui.info(&format!(

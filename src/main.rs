@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use bruce_method_release::commands::check::Outcome;
 use bruce_method_release::commands::dependencies::{self, Verdict};
 use bruce_method_release::commands::link::{self, State};
-use bruce_method_release::commands::{app, check, release, setup, start, status, sync};
+use bruce_method_release::commands::{app, check, release, setup, start, status, store, sync};
 use bruce_method_release::github::ReleaseState;
 use bruce_method_release::ui::Ui;
 use bruce_method_release::{Repo, Version};
@@ -36,10 +36,11 @@ enum Command {
     /// Runs the checks a release needs, changing nothing.
     Check,
     /// Releases the version on the repository's branch, and starts the next one. For an app, it stops once the
-    /// installers are on the draft release, for them to be tried, and the next release publishes it.
+    /// installers are on the draft release, for them to be tried, and the next release publishes it; for the App
+    /// Store's, once they are uploaded to App Store Connect, for them to be tried in TestFlight.
     Release,
     /// For an app: builds the installers of what is on the version's branch with its workflow, and downloads them,
-    /// releasing nothing.
+    /// releasing nothing; for the App Store's, builds and signs them without uploading them.
     Try,
     /// For an app: watches its workflow's latest run, of a try or a release, and downloads the installers.
     Watch,
@@ -102,6 +103,12 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether the repository releases to the App Store, whose apps `try`, `watch` and `release` handle in their own way.
+fn is_store(repo: &Repo) -> bool {
+    repo.manifests()
+        .is_ok_and(|manifests| manifests.kind == bruce_method_release::manifest::Kind::AppStore)
+}
+
 /// Runs the command, returning whether it succeeded, e.g. false for a check which failed.
 fn run(cli: Cli) -> Result<bool> {
     let dir = match cli.repo {
@@ -116,8 +123,16 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Start { version } => start::start(&repo, *version, ui)?,
         Command::Check => succeeded = print_checks(&check::check(&repo, ui)?),
         Command::Release => release::release(&repo, ui)?,
+        Command::Try if is_store(&repo) => store::try_apps(&repo, ui)?,
         Command::Try => app::try_installers(&repo, ui)?,
+        Command::Watch if is_store(&repo) => store::watch(&repo, ui)?,
         Command::Watch => app::watch(&repo, ui)?,
+        Command::Download if is_store(&repo) => {
+            anyhow::bail!(
+                "{}'s apps are installed from TestFlight; try downloads them all",
+                repo.name
+            )
+        }
         Command::Download => app::download(&repo, ui)?,
         Command::Untag => app::untag(&repo, ui)?,
         Command::Setup => setup::setup(&repo, ui)?,

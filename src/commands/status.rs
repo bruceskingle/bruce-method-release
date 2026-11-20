@@ -47,7 +47,7 @@ pub fn status(repo: &Repo) -> Result<Vec<RepoStatus>> {
     }
     let mut first = status_of(repo, links)?;
     if let Ok(version) = &first.version
-        && repo.manifests()?.kind == Kind::App
+        && matches!(repo.manifests()?.kind, Kind::App | Kind::AppStore)
     {
         first.app = Some(app_status(repo, *version)?);
     }
@@ -77,7 +77,10 @@ fn status_of(repo: &Repo, links: Vec<Link>) -> Result<RepoStatus> {
 
 /// Where the release of an app's version is, asking GitHub, as the tags and runs are made there.
 fn app_status(repo: &Repo, version: Version) -> Result<AppStatus> {
-    let settings = manifest::app_settings(&repo.dir)?;
+    let workflow = match repo.manifests()?.kind {
+        Kind::AppStore => manifest::store_settings(&repo.dir)?.workflow,
+        _ => manifest::app_settings(&repo.dir)?.workflow,
+    };
     let commit_of = |tag: String| -> Result<Option<String>> {
         let line = repo.git(&[
             "ls-remote",
@@ -93,6 +96,6 @@ fn app_status(repo: &Repo, version: Version) -> Result<AppStatus> {
         tried: commit_of(version.test_tag())?,
         tagged: commit_of(version.tag())?,
         release: github::release_state(repo, &version.tag())?,
-        runs: github::runs(repo, &settings.workflow, None, 3)?,
+        runs: github::runs(repo, &workflow, None, 3)?,
     })
 }

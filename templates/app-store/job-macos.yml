@@ -16,8 +16,17 @@
           rustup default stable
           rustc --version
 
-      # Built from source with its own Cargo.lock, rather than downloading a prebuilt binary.
+      # The Dioxus CLI is built from source with its own Cargo.lock, rather than downloading a prebuilt binary, which
+      # takes about ten minutes, so what was built is kept in the cache for the next run of the same version.
+      - name: Find the Dioxus CLI in the cache
+        id: dx
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/dx*
+          key: dx-${{ runner.os }}-${{ runner.arch }}-${{ env.DX_VERSION }}
+
       - name: Install the Dioxus CLI
+        if: steps.dx.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli --version "$DX_VERSION" --locked
 
       - name: Run the tests
