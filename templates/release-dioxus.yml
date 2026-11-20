@@ -1,0 +1,323 @@
+{{header}}
+#
+# Builds the installers of a Dioxus desktop app for a tag, tests them, and keeps them on the run's page under
+# Artifacts, one artifact for each platform. The tag is testX.Y.Z, for bruce-method-release's try, or releaseX.Y.Z, for
+# its release. The libraries the app uses come from crates.io, unless try gives the libraries it links, which are
+# checked out beside it, as on a developer's computer.
+#
+# With attach, the installers are also attached to the draft GitHub release for the tag, ready to be tried before the
+# release is published. A published release is never changed, and a release never takes linked libraries.
+#
+# The repository's own steps, if it has them, are its hooks, local actions which it owns: .github/actions/before-bundle,
+# run before the installers are built, e.g. to build programs they include. It can also be run from the Actions tab
+# (Release > Run workflow).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build, e.g. release0.4.4"
+        required: true
+      attach:
+        description: "Attach the installers to the draft release for the tag"
+        type: boolean
+        default: false
+      libraries:
+        description: "Linked libraries to check out beside the app, each repository@branch, separated by spaces"
+        required: false
+        default: ""
+      patch:
+        description: "The [patch.crates-io] table which builds the app with the linked libraries"
+        required: false
+        default: ""
+
+env:
+  TAG: ${{ inputs.tag }}
+  LIBRARIES: ${{ inputs.libraries }}
+  PATCH: ${{ inputs.patch }}
+  # The dioxus version in Cargo.lock.
+  DX_VERSION: "{{dx_version}}"
+  CARGO_TERM_COLOR: always
+
+# Read only, except for the publish job.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      # Let the other builds finish if one fails, so that all the problems are seen at once.
+      fail-fast: false
+      matrix:
+        include:
+{{matrix}}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: {{repo}}
+
+    steps:
+      # In a directory of its own, as on a developer's computer, which the later steps run in.
+      - name: Check out {{repo}}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          path: {{repo}}
+          # The build records the tag and branch, so it needs the history.
+          fetch-depth: 0
+
+      # The libraries try links, each checked out beside the app, as on the developer's computer, with the same patch,
+      # which the developer's git-ignored .cargo/config.toml has.
+      - name: Check out the linked libraries
+        if: inputs.libraries != ''
+        run: |
+          if [ "${{ inputs.attach }}" = true ]; then
+            echo "A release never takes linked libraries"
+            exit 1
+          fi
+          for library in $LIBRARIES; do
+            name=${library%@*}
+            branch=${library#*@}
+            echo "Checking out $name's $branch"
+            git clone --quiet --branch "$branch" "https://github.com/${{ github.repository_owner }}/$name" "../$name"
+          done
+          mkdir -p .cargo
+          printf '%s\n' "$PATCH" > .cargo/config.toml
+          cat .cargo/config.toml
+
+      # The Windows ARM runner may not have Rust installed.
+      - name: Install rustup
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        shell: pwsh
+        working-directory: .
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            .\rustup-init.exe -y --profile minimal --default-toolchain none
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+
+      # ring, which is used for TLS, must be compiled with Clang on Windows ARM.
+      - name: Install Clang
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        shell: pwsh
+        working-directory: .
+        run: |
+          if (Get-Command clang -ErrorAction SilentlyContinue) {
+            clang --version
+            exit 0
+          }
+          $llvm = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$llvm\clang.exe")) {
+            Invoke-WebRequest https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe -OutFile llvm-installer.exe
+            Start-Process .\llvm-installer.exe -ArgumentList '/S' -Wait
+          }
+          $llvm | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$llvm\clang.exe" --version
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      # Built from source with its own Cargo.lock, rather than downloading a prebuilt binary.
+      - name: Install the Dioxus CLI
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+
+      - name: Run the tests
+        run: cargo test --locked
+
+      # The Developer ID certificate and App Store Connect API key, from the repository's secrets, for dx bundle, which
+      # signs the app and the .dmg with the certificate and notarizes and staples both with the key, see docs/Release.md.
+      # Without the secrets, e.g. on a fork, the app is built unsigned. They go to the later steps through GITHUB_ENV,
+      # which GitHub keeps masked in the logs, and the key to a file, as notarytool needs it.
+      - name: Set up signing and notarizing
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          if [ -z "$CERTIFICATE" ]; then
+            echo "No APPLE_CERTIFICATE secret, so the app is not signed"
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE=$CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$CERTIFICATE_PASSWORD"
+            echo "SIGNED=true"
+          } >> "$GITHUB_ENV"
+          if [ -z "$API_KEY" ] || [ -z "$API_ISSUER" ] || [ -z "$API_KEY_CONTENT" ]; then
+            echo "No App Store Connect API key secrets, so the app is signed but not notarized"
+            exit 0
+          fi
+          key_path="$RUNNER_TEMP/AuthKey_$API_KEY.p8"
+          printf '%s' "$API_KEY_CONTENT" | base64 --decode > "$key_path"
+          {
+            echo "APPLE_API_KEY=$API_KEY"
+            echo "APPLE_API_ISSUER=$API_ISSUER"
+            echo "APPLE_API_KEY_PATH=$key_path"
+            echo "NOTARIZED=true"
+          } >> "$GITHUB_ENV"
+
+      # The repository's own steps before the installers are built, if it has any, e.g. building programs they include.
+      - name: Before bundling
+        if: hashFiles('{{repo}}/.github/actions/before-bundle/action.yml') != ''
+        uses: ./{{repo}}/.github/actions/before-bundle
+
+      # The defaults: a .dmg on macOS and an NSIS setup.exe on Windows.
+      - name: Build the installers
+        # On macOS, tried once more if it fails, as its last steps ask Apple's servers to notarize the app and staple
+        # the ticket, which the runners' network sometimes drops, e.g. a notary request which timed out, or stapler's
+        # exit code 68, once Apple had accepted the app. The second try builds nothing again, only bundles.
+        run: |
+          if dx bundle --release; then
+            exit 0
+          fi
+          if [ "$RUNNER_OS" != macOS ]; then
+            exit 1
+          fi
+          echo "dx bundle failed, trying once more, in case it was Apple's servers"
+          sleep 30
+          dx bundle --release
+
+      - name: Collect the installers
+        id: collect
+        run: |
+          mkdir -p dist
+          find target/dx -path '*/bundle/*' -type f \( -name '*.dmg' -o -name '*-setup.exe' \) -exec cp {} dist/ \;
+          ls -l dist
+          if [ -z "$(ls dist)" ]; then
+            echo "No installers were built"
+            exit 1
+          fi
+
+      # That the .dmg and the app in it are signed, by a Developer ID, and if notarized, that the tickets are stapled to
+      # both and Gatekeeper accepts them, as it would on a user's Mac when they are downloaded. stapler asks Apple for
+      # the ticket, a request which the runners' network sometimes drops, so it is tried up to three times.
+      - name: Check the app is signed and notarized
+        if: runner.os == 'macOS' && env.SIGNED == 'true'
+        run: |
+          dmg=$(ls dist/*.dmg | head -1)
+          codesign --verify --verbose=2 "$dmg"
+          mount=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" > /dev/null
+          app=$(ls -d "$mount"/*.app | head -1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=2 "$app" 2>&1 | grep -E "Authority|TeamIdentifier|Timestamp|Runtime"
+          validate() {
+            for attempt in 1 2 3; do
+              xcrun stapler validate "$1" && return 0
+              sleep 20
+            done
+            return 1
+          }
+          if [ "$NOTARIZED" = true ]; then
+            validate "$dmg"
+            validate "$app"
+            spctl --assess --type execute --verbose=2 "$app"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          fi
+          hdiutil detach "$mount" > /dev/null
+
+      # Installs the app as a user would, silently, checks that the programs Dioxus.toml's external_bin lists are beside
+      # it, and that it starts and is still running 30 seconds later.
+      - name: Check the installed app starts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter *-setup.exe | Select-Object -First 1
+          if (-not $setup) {
+            throw "No setup.exe was built, see Build the installers"
+          }
+          $install = Start-Process $setup.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "The installer failed, exit code $($install.ExitCode)"
+          }
+
+          # Installed for the current user in LOCALAPPDATA, or for everyone in Program Files. The uninstaller is in the
+          # same directory, as are the programs installed beside the app, so they are left out.
+          $beside = @({{beside}})
+          $exe = Get-ChildItem "$env:LOCALAPPDATA", "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles" -Recurse -Depth 1 -Filter *.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '{{exe_pattern}}' -and $_.Name -notlike '*uninstall*' -and $beside -notcontains $_.Name } |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "The installed app was not found"
+          }
+          foreach ($program in $beside) {
+            if (-not (Test-Path (Join-Path $exe.DirectoryName $program))) {
+              throw "$program, from Dioxus.toml's external_bin, was not installed beside the app"
+            }
+          }
+          Write-Host "Starting $($exe.FullName)"
+
+          # Its output is kept, and a panic shows where it happened, to see why if it does not start.
+          $env:RUST_BACKTRACE = "1"
+          $app = Start-Process $exe.FullName -PassThru -RedirectStandardOutput app-stdout.log -RedirectStandardError app-stderr.log
+          Start-Sleep -Seconds 30
+          if ($app.HasExited) {
+            Write-Host "=== stdout"
+            Get-Content app-stdout.log -Tail 100
+            Write-Host "=== stderr"
+            Get-Content app-stderr.log -Tail 100
+            throw "The app exited with code $($app.ExitCode)"
+          }
+          Stop-Process -Id $app.Id
+          Write-Host "The app started"
+
+      # Also when the app start check fails, so that the installers can be tried by hand to see why. They are only
+      # attached to a release if every build succeeded, see publish.
+      - name: Keep the installers
+        if: ${{ !cancelled() && steps.collect.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: {{repo}}/dist/*
+          if-no-files-found: error
+
+  # Only runs if every build succeeded, so a release never gets some of the installers but not others.
+  publish:
+    name: Attach to the draft release
+    if: inputs.attach
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # To attach the files to the release.
+      contents: write
+      # To record where the files were built, see the repository's Attestations.
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check the release is a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "$TAG is not a draft release, published releases are not changed"
+            exit 1
+          fi
+
+      - name: Fetch the installers
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Record where they were built
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Attach them to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

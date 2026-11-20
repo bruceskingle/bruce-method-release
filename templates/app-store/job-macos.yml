@@ -1,0 +1,87 @@
+  {{job}}:
+    name: Build the Mac app, in {{dioxus}}
+    runs-on: macos-latest
+    env:
+      # The dioxus version in Cargo.lock.
+      DX_VERSION: "{{dx_version}}"
+      # The oldest macOS the app runs on. It is built for Apple silicon only, which the App Store accepts from
+      # macOS 12; a universal build, for Intel Macs too, would take twice as long.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+{{setup_steps}}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      # Built from source with its own Cargo.lock, rather than downloading a prebuilt binary.
+      - name: Install the Dioxus CLI
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+
+      - name: Run the tests
+        run: cargo test --workspace --locked
+
+      - name: Build the app
+        working-directory: {{dioxus}}
+        run: dx build --release --platform desktop{{features}}
+
+      # The App Store's version, build number, category, oldest macOS and, if exempt, its encryption in its Info.plist,
+      # and its icon, which dx build names there but, unlike dx bundle, does not copy in: the .icns among the icons in
+      # Dioxus.toml. Then it is signed here, without a certificate, only to carry its entitlements, e.g. the App
+      # Sandbox's, which the export keeps when it signs it for the store.
+      - name: Prepare the app
+        run: |
+          app=$(find target/dx -path '*/release/macos/*.app' -maxdepth 5 -type d | head -1)
+          if [ -z "$app" ]; then
+            echo "The app was not built"
+            exit 1
+          fi
+          info="$app/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$info"
+          plutil -replace CFBundleVersion -string "$BUILD" "$info"
+          plutil -replace LSApplicationCategoryType -string "{{category}}" "$info"{{encryption}}
+          plutil -replace LSMinimumSystemVersion -string "$MACOSX_DEPLOYMENT_TARGET" "$info"
+          icon=$(grep -o '"[^"]*\.icns"' "{{dioxus}}/Dioxus.toml" | head -1 | tr -d '"')
+          if [ -z "$icon" ]; then
+            echo "The App Store needs an icon: add an .icns to the bundle's icons in {{dioxus}}/Dioxus.toml"
+            exit 1
+          fi
+          mkdir -p "$app/Contents/Resources"
+          cp "{{dioxus}}/$icon" "$app/Contents/Resources/$(basename "$icon")"
+          plutil -replace CFBundleIconFile -string "$(basename "$icon")" "$info"
+          codesign --force --deep --sign - --entitlements "{{entitlements}}" "$app"
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      # An Xcode archive of the app, as Xcode makes one, so that xcodebuild exports it as it would one of its own.
+      - name: Archive the app
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          archive="$RUNNER_TEMP/app.xcarchive"
+          name=$(basename "$APP")
+          mkdir -p "$archive/Products/Applications"
+          cp -R "$APP" "$archive/Products/Applications/"
+          info="$APP/Contents/Info.plist"
+          identifier=$(plutil -extract CFBundleIdentifier raw "$info")
+          plist="$archive/Info.plist"
+          plutil -create xml1 "$plist"
+          plutil -insert ApplicationProperties -dictionary "$plist"
+          plutil -insert ApplicationProperties.ApplicationPath -string "Applications/$name" "$plist"
+          plutil -insert ApplicationProperties.CFBundleIdentifier -string "$identifier" "$plist"
+          plutil -insert ApplicationProperties.CFBundleShortVersionString -string "$VERSION" "$plist"
+          plutil -insert ApplicationProperties.CFBundleVersion -string "$BUILD" "$plist"
+          plutil -insert ApplicationProperties.Architectures -array "$plist"
+          for architecture in $(lipo -archs "$APP/Contents/MacOS/"*); do
+            plutil -insert ApplicationProperties.Architectures -string "$architecture" -append "$plist"
+          done
+          plutil -insert ApplicationProperties.SigningIdentity -string "Apple Distribution" "$plist"
+          plutil -insert ApplicationProperties.Team -string "$TEAM" "$plist"
+          plutil -insert ArchiveVersion -integer 2 "$plist"
+          plutil -insert CreationDate -date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$plist"
+          plutil -insert Name -string "${name%.app}" "$plist"
+          plutil -insert SchemeName -string "${name%.app}" "$plist"
+          plutil -p "$plist"
+
+{{export_steps}}

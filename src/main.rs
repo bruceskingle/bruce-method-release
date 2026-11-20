@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand};
 use bruce_method_release::commands::check::Outcome;
 use bruce_method_release::commands::dependencies::{self, Verdict};
 use bruce_method_release::commands::link::{self, State};
-use bruce_method_release::commands::{check, release, start, status, sync};
+use bruce_method_release::commands::{app, check, release, setup, start, status, sync};
+use bruce_method_release::github::ReleaseState;
 use bruce_method_release::ui::Ui;
 use bruce_method_release::{Repo, Version};
 
@@ -34,13 +35,27 @@ enum Command {
     Start { version: Option<Version> },
     /// Runs the checks a release needs, changing nothing.
     Check,
-    /// Releases the version on the repository's branch, and starts the next one.
+    /// Releases the version on the repository's branch, and starts the next one. For an app, it stops once the
+    /// installers are on the draft release, for them to be tried, and the next release publishes it.
     Release,
+    /// For an app: builds the installers of what is on the version's branch with its workflow, and downloads them,
+    /// releasing nothing.
+    Try,
+    /// For an app: watches its workflow's latest run, of a try or a release, and downloads the installers.
+    Watch,
+    /// For an app: downloads the installer for this computer from its workflow's latest run, of a try or a release.
+    Download,
+    /// Makes the repository's workflows and standard files from the method's templates, and its GitHub settings as the
+    /// method wants them, after listing what it will do and asking.
+    Setup,
+    /// For an app: deletes the draft release and the release's tag, to make more changes before releasing.
+    Untag,
     /// Builds a library from its checkout next to this repository, while both are developed.
     Link { library: String },
     /// Removes the links to a library, or else every link no longer needed.
     Unlink { library: Option<String> },
-    /// Brings the checkout, and the libraries it links, up to date with GitHub, by fast forward only.
+    /// Brings the checkout, and the libraries it links, up to date with GitHub, by fast forward only, switching to a
+    /// branch, or a version's, e.g. 0.6.0, if given, or else from a version already released to the latest one.
     Sync { branch: Option<String> },
     /// Lists the libraries next to this repository which it depends on, in the order to release them, each with a tick
     /// if it is ready or a cross and what is to be done, changing nothing.
@@ -101,6 +116,11 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Start { version } => start::start(&repo, *version, ui)?,
         Command::Check => succeeded = print_checks(&check::check(&repo, ui)?),
         Command::Release => release::release(&repo, ui)?,
+        Command::Try => app::try_installers(&repo, ui)?,
+        Command::Watch => app::watch(&repo, ui)?,
+        Command::Download => app::download(&repo, ui)?,
+        Command::Untag => app::untag(&repo, ui)?,
+        Command::Setup => setup::setup(&repo, ui)?,
         Command::Link { library } => link::link(&repo, library, ui)?,
         Command::Unlink { library } => link::unlink(&repo, library.as_deref(), ui)?,
         Command::Sync { branch } => sync::sync(&repo, branch.as_deref(), ui)?,
@@ -174,6 +194,28 @@ fn print_status(repo: &Repo) -> Result<()> {
         match each.latest_release {
             Some(release) => println!("  last released {release}, tag {}", release.tag()),
             None => println!("  not released yet"),
+        }
+        if let Some(app) = &each.app {
+            let tag = |commit: &Option<String>| commit.clone().unwrap_or_else(|| "none".to_string());
+            println!(
+                "  tried {}, tagged {}, GitHub release {}",
+                tag(&app.tried),
+                tag(&app.tagged),
+                match app.release {
+                    ReleaseState::None => "none",
+                    ReleaseState::Draft => "a draft",
+                    ReleaseState::Published => "published",
+                }
+            );
+            for run in &app.runs {
+                println!(
+                    "  run {} from {}, {}, {}",
+                    run.id,
+                    run.head_branch,
+                    run.state(),
+                    run.created_at
+                );
+            }
         }
         for link in &each.links {
             let local = link

@@ -5,8 +5,10 @@
 //! with, so that a desktop window can drive them as the command line does.
 
 pub mod commands;
+pub mod github;
 pub mod links;
 pub mod manifest;
+pub mod notes;
 pub mod process;
 pub mod repo;
 pub mod ui;

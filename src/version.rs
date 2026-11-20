@@ -27,6 +27,12 @@ impl Version {
         format!("release{self}")
     }
 
+    /// The tag of the commit on the version's branch last tried, e.g. by building an app's installers before it is
+    /// released, which is moved to each commit tried.
+    pub fn test_tag(&self) -> String {
+        format!("test{self}")
+    }
+
     /// The version developed after this one is released, `X.(Y+1).0`.
     pub fn next_minor(&self) -> Version {
         Version::new(self.major, self.minor + 1, 0)

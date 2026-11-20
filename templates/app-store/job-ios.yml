@@ -1,0 +1,30 @@
+  {{job}}:
+    name: Build the iOS app, {{scheme}}
+    runs-on: macos-latest
+    steps:
+{{setup_steps}}
+
+      # With the team, automatic signing and the version on the command line, which override the project's own, e.g.
+      # its git-ignored Signing.xcconfig, which the runner does not have.
+      - name: Archive {{scheme}}
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          xcodebuild archive \
+            -project "{{project}}" \
+            -scheme "{{scheme}}" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$API_KEY" \
+            -authenticationKeyIssuerID "$API_ISSUER" \
+            DEVELOPMENT_TEAM="$TEAM" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD"
+
+{{export_steps}}

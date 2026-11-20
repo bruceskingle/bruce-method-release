@@ -19,6 +19,9 @@ pub enum Kind {
     Crate,
     /// An app, whose installers are built by a GitHub workflow.
     App,
+    /// Apps for Apple's App Store, e.g. an iOS app and a Mac app, which a GitHub workflow builds, signs and uploads to
+    /// App Store Connect.
+    AppStore,
 }
 
 /// A crate of a repository.
@@ -266,10 +269,126 @@ fn kind_of(metadata: &Option<serde_json::Value>) -> Option<Result<Kind>> {
     Some(match kind.as_str() {
         Some("crate") => Ok(Kind::Crate),
         Some("app") => Ok(Kind::App),
+        Some("app-store") => Ok(Kind::AppStore),
         _ => Err(anyhow!(
-            "bruce-method's kind should be \"crate\" or \"app\", not {kind}"
+            "bruce-method's kind should be \"crate\", \"app\" or \"app-store\", not {kind}"
         )),
     })
+}
+
+/// What an app's release builds, from its `[package.metadata.bruce-method]`, or `[workspace.metadata.bruce-method]`:
+/// the GitHub workflow which builds its installers, and the installers it builds.
+///
+/// The workflow is run by hand (`workflow_dispatch`), with two inputs: `tag`, the tag to build, `testX.Y.Z` or
+/// `releaseX.Y.Z`, and `attach`, true to attach the installers to the draft GitHub release for the tag. It keeps each
+/// platform's installer as an artifact of the run named for the platform, e.g. `macos-aarch64`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AppSettings {
+    /// The workflow's file in `.github/workflows`, `release.yml` unless set.
+    #[serde(default = "default_workflow")]
+    pub workflow: String,
+    pub installers: Vec<Installer>,
+}
+
+fn default_workflow() -> String {
+    "release.yml".to_string()
+}
+
+/// An installer an app's workflow builds.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Installer {
+    /// The platform it is for, `<os>-<architecture>`, e.g. `macos-aarch64`, `macos-x64`, `windows-x64` or
+    /// `windows-arm64`, which also names the run's artifact with it in.
+    pub platform: String,
+    /// Its file's name, with `{version}` for the version, e.g. `BruceSmartHome_{version}_aarch64.dmg`.
+    pub file: String,
+}
+
+impl Installer {
+    /// Its file's name for a version.
+    pub fn file_for(&self, version: Version) -> String {
+        self.file.replace("{version}", &version.to_string())
+    }
+}
+
+/// The `bruce-method` table of the Cargo.toml at the root of `dir`, the workspace's or else its package's, after
+/// checking that it is of the kind given.
+fn method_table(dir: &Path, kind: &str) -> Result<serde_json::Value> {
+    let json = process::output(dir, "cargo", &["metadata", "--format-version", "1", "--no-deps"])?;
+    let metadata: Metadata = serde_json::from_str(&json).context("could not read cargo metadata's output")?;
+    let table = std::iter::once(&metadata.metadata)
+        .chain(metadata.packages.iter().map(|package| &package.metadata))
+        .find_map(|metadata| metadata.as_ref()?.get("bruce-method"))
+        .ok_or_else(|| anyhow!("its Cargo.toml has no [package.metadata.bruce-method]"))?;
+    if table.get("kind").and_then(|found| found.as_str()) != Some(kind) {
+        bail!("its Cargo.toml's bruce-method table does not say kind = \"{kind}\"");
+    }
+    Ok(table.clone())
+}
+
+/// What an App Store repository's release builds, from its `[workspace.metadata.bruce-method]`, or
+/// `[package.metadata.bruce-method]`: the GitHub workflow which builds, signs and uploads its apps, and the apps.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct StoreSettings {
+    /// The workflow's file in `.github/workflows`, `release.yml` unless set.
+    #[serde(default = "default_workflow")]
+    pub workflow: String,
+    pub apps: Vec<StoreApp>,
+}
+
+/// An app for the App Store, by its platform.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "platform", rename_all = "lowercase", deny_unknown_fields)]
+pub enum StoreApp {
+    /// An iOS app, made by Xcode.
+    Ios {
+        /// Its Xcode project, from the repository's root, e.g. `ios/QuizParty.xcodeproj`.
+        project: String,
+        /// The scheme which builds it.
+        scheme: String,
+        /// A Swift package of its, from the repository's root, whose tests CI runs, e.g. `ios/QuizPartyKit`.
+        #[serde(default, rename = "swift-package")]
+        swift_package: Option<String>,
+    },
+    /// A Mac app made with Dioxus, which the workflow puts in an Xcode archive to sign and upload.
+    Macos {
+        /// The Dioxus app's folder, with its Dioxus.toml, from the repository's root, e.g. `server`.
+        dioxus: String,
+        /// The Cargo features of the App Store's build, e.g. one which leaves out what the App Sandbox does not allow.
+        #[serde(default)]
+        features: Vec<String>,
+        /// Its entitlements file, from the repository's root, which must ask for the App Sandbox.
+        entitlements: String,
+        /// Its App Store category, as `LSApplicationCategoryType`, e.g. `public.app-category.trivia-games`.
+        category: String,
+        /// Whether its only encryption is exempt from export documentation, e.g. HTTPS through Apple's own
+        /// frameworks, so that each build declares so (`ITSAppUsesNonExemptEncryption` false) and App Store Connect
+        /// does not ask. It is false unless set, as it is a declaration only the app's author can make.
+        #[serde(default, rename = "exempt-encryption")]
+        exempt_encryption: bool,
+    },
+}
+
+/// Reads an App Store repository's settings from the Cargo.toml at the root of `dir`.
+pub fn store_settings(dir: &Path) -> Result<StoreSettings> {
+    let settings: StoreSettings = serde_json::from_value(method_table(dir, "app-store")?)
+        .context("its bruce-method table should list its apps, see the README's Settings")?;
+    if settings.apps.is_empty() {
+        bail!("its bruce-method table lists no apps");
+    }
+    Ok(settings)
+}
+
+/// Reads an app's settings from the Cargo.toml at the root of `dir`, failing if it is not an app's or does not say
+/// which installers it builds.
+pub fn app_settings(dir: &Path) -> Result<AppSettings> {
+    let table = method_table(dir, "app")?;
+    let settings: AppSettings = serde_json::from_value(table)
+        .context("its [package.metadata.bruce-method] should list its installers, see the README's Settings")?;
+    if settings.installers.is_empty() {
+        bail!("its [package.metadata.bruce-method] lists no installers");
+    }
+    Ok(settings)
 }
 
 /// A change made to a Cargo.toml, for saying what was done.

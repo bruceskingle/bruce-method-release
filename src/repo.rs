@@ -218,6 +218,13 @@ impl Repo {
         self.git(&["remote", "get-url", "origin"])
     }
 
+    /// The repository's page on GitHub, e.g. `https://github.com/owner/name`, from its origin, whether that is an SSH
+    /// or HTTPS URL, so that a fork's releases link to the fork.
+    pub fn github_url(&self) -> Result<String> {
+        let url = self.origin_url()?;
+        github_page(&url).with_context(|| format!("{}: its origin, {url}, is not a GitHub repository", self.name))
+    }
+
     /// The URL another repository of the same owner would have, e.g. for cloning it next to this one.
     pub fn sibling_url(&self, name: &str) -> Result<String> {
         let url = self.origin_url()?;
@@ -243,6 +250,15 @@ impl Repo {
     }
 }
 
+/// The page on GitHub of a repository's URL, e.g. `https://github.com/owner/name` from `git@github.com:owner/name.git`.
+fn github_page(url: &str) -> Option<String> {
+    let (_, path) = url.split_once("github.com")?;
+    let path = path.trim_start_matches([':', '/']).trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then(|| format!("https://github.com/{owner}/{name}"))
+}
+
 /// Whether a version of a crate is on crates.io, asking it with `cargo info`, from a directory outside any checkout so
 /// that no patch or lock file stands in for it.
 pub fn is_published(name: &str, version: Version) -> Result<bool> {
@@ -258,4 +274,19 @@ pub fn is_published(name: &str, version: Version) -> Result<bool> {
         return Ok(false);
     }
     bail!("could not ask crates.io for {name} {version}: {}", ran.tail(5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_github_page() {
+        let page = Some("https://github.com/o/r".to_string());
+        assert_eq!(github_page("git@github.com:o/r.git"), page);
+        assert_eq!(github_page("https://github.com/o/r.git"), page);
+        assert_eq!(github_page("https://github.com/o/r"), page);
+        assert_eq!(github_page("ssh://git@github.com/o/r"), page);
+        assert_eq!(github_page("/tmp/git/origins/r.git"), None);
+    }
 }

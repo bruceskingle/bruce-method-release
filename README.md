@@ -7,8 +7,8 @@ right order, and the tag, the `main` branch and the published crate are always t
 
 It is the first of the `bruce-method-*` tools, for the way of working described here.
 
-**Status:** releases crates to crates.io; it released its own first version, 0.1.0. Apps, which build installers,
-are still released by their own steps.
+**Status:** releases crates to crates.io; it released its own first version, 0.1.0. Releasing apps, whose installers
+a GitHub workflow builds, is new in 0.2.0, see [Apps](#apps), and replaces Bruce's Smart Home's `scripts/release.sh`.
 
 ## Installing
 
@@ -130,31 +130,62 @@ part way, e.g. at a network failure, carries on from where it stopped when run a
 
 | Command | What it does |
 |---|---|
-| `status` | The branch, version, uncommitted and unpushed changes, last release and links of this repository and of the libraries it links, with the links which can be removed. |
+| `status` | The branch, version, uncommitted and unpushed changes, last release and links of this repository and of the libraries it links, with the links which can be removed. For an app, also the commits last tried and tagged, its GitHub release, and its workflow's latest runs. |
 | `start [X.Y.Z]` | Starts a version's branch, sets its version in `Cargo.toml`, commits and pushes it. With no version, `vX.(Y+1).0` from `main`; with a fix's version, `vX.Y.(Z+1)` from the tag `releaseX.Y.Z`. |
 | `check` | The checks a release needs, without changing anything; see below. |
 | `release` | The checks, then the squash merge to `main` by pull request, the tag, publishing from the tag, the GitHub release, the unlinks next to it, and `start` of the next version. The repositories next to it which link the version released are unlinked, and those which take its crates by path, e.g. `{ version = "0.1.0", path = "../lib" }` or a path alone, take that version from crates.io instead, as its checkout moves on to the next version. One requiring a version which the release does not meet is left by path. |
+| `try` | For an app: builds the installers of the branch's last commit with its workflow, and downloads them, releasing nothing; see [Apps](#apps). |
+| `watch` | For an app: watches its workflow's latest run, of a `try` or a `release`, e.g. after Ctrl+C, and downloads the installers. |
+| `download` | For an app: downloads the installer for this computer from the latest run, e.g. to try it on another computer. |
+| `untag` | For an app: deletes the draft release and the release's tag, to make more changes before publishing. |
+| `setup` | Makes the repository's workflows and standard files from the method's templates, keeps them so, and sets its GitHub settings as the method wants them; see [Setup](#setup). |
 | `link <library>` | Links this repository to the library's checkout next to it. |
 | `unlink [<library>]` | Removes a link, or every link which is no longer needed. Given a library, it also makes this repository's path dependencies on it dependencies on its latest release on crates.io, as `release` does. |
 | `dependencies [-v]` | Lists the libraries next to this repository which it depends on, directly or through one another, in the order to release them, a line each: a tick for one which is ready, or a cross and what is to be done, e.g. `release 0.1.0, which bruce-smart-home needs`, after which `check` in that library says what stops it. With `-v`, each with how its users take it, by path, linked or from crates.io, and the versions asked of crates.io. Changes nothing. |
-| `sync [<branch>]` | Brings this checkout, and the libraries it links, up to date with GitHub, by fast forward only, optionally switching it to another branch first; then links the libraries next to it of which it requires a version not yet published, putting each on that version's branch, e.g. on a second computer, where the links are not. |
+| `sync [<branch>]` | Brings this checkout, and the libraries it links, up to date with GitHub, by fast forward only, optionally switching it to another branch first, given by name or by version, e.g. `0.6.0` for `v0.6.0`; with none, a checkout on the branch of a version already released moves on to the latest version's branch, e.g. on a computer which tries each version's installers; then links the libraries next to it of which it requires a version not yet published, putting each on that version's branch, e.g. on a second computer, where the links are not. |
 
 ### What a release checks
 
 - The repository is on its `vX.Y.Z` branch, with `X.Y.Z` in every crate's `Cargo.toml`, nothing uncommitted, and
   everything pushed.
 - `releaseX.Y.Z` is not already a tag.
-- No library is linked, and every version required is on crates.io.
+- No library is linked, nothing is taken by path from outside the repository, and every version required is on
+  crates.io.
 - `main` is merged into the branch, e.g. after a fix's release, so that the squash merge is the branch exactly.
-- `docs/ChangeLog.md` has a `# Release X.Y.Z` section, which becomes the GitHub release's notes.
+- `docs/ChangeLog.md` has a `Release X.Y.Z` section, under a heading of any level, e.g. `# Release X.Y.Z`, or
+  `## Release X.Y.Z` under a `# Change Log` title, which becomes the GitHub release's notes: its lines are unwrapped, as
+  GitHub shows each line break, and its relative links made links to the docs on GitHub at the tag.
 - `cargo fmt --check` passes, if the repository has a `rustfmt.toml`, `cargo clippy` with no warnings, `cargo test`, and
   `cargo deny check`, if it has a `deny.toml`.
 - `cargo publish --dry-run` passes, for a library.
-- CI passed on GitHub for the branch's last commit, if it has workflows.
+- The files `setup` makes are as it would make them, see [Setup](#setup).
+- CI passed on GitHub for the branch's last commit, if it has workflows. For an app, a successful `try` of it is that
+  run.
 
 A library's crates are published in the order they depend on one another, e.g. a derive macro before the library
 which uses it, from a worktree of the tag, so that what is published is exactly the tagged commit, with no links. After
 publishing, the tool checks that the packages recorded the tag's commit, in their `.cargo_vcs_info.json`.
+
+### Apps
+
+An app's installers are built by a GitHub workflow, see [Settings](#settings), on GitHub's computers for each
+platform, and tried before anyone else gets them, twice:
+
+1. `try` builds the installers of the branch's last commit, tagged `testX.Y.Z`, and downloads them to
+   `~/Downloads/<repo>-X.Y.Z-test`, releasing nothing. Try them, and change and try again until they are right. A
+   successful try is also the CI run the release checks for.
+2. `release` makes the checks, squash merges the branch into `main`, tags it `releaseX.Y.Z`, merges `main` back into
+   the branch, which changes no files but means a later pull request shows only what is new, makes a draft GitHub
+   release with the ChangeLog's notes, has the workflow build the installers from the tag and attach them to the draft,
+   and downloads them to `~/Downloads/<repo>-X.Y.Z`. Then it stops, for them to be tried, and the draft's notes read.
+3. `release` again publishes the draft as the latest release, and starts the next version.
+
+To change something after step 2, `untag` deletes the draft and the tag; commit the change to the branch, `try` it, and
+`release` again, which merges the new changes. A published release is never changed: a fix is a new version.
+
+`watch` carries on watching a run after Ctrl+C, and `download` fetches only this computer's installer, e.g. on a
+second computer which tries it. A release which stops part way, e.g. while its installers are built, carries on from
+where it stopped, watching a run already going rather than starting another.
 
 ### Separate crates
 
@@ -171,6 +202,39 @@ with the same version, and each is checked, published and given the next version
   own.
 - The other crates are checked as a workspace's are, with clippy and their tests.
 
+## Setup
+
+`setup` makes a repository's workflows and standard files from templates in the tool, so that every repository of a
+kind is set up the same way, and a change to the method reaches each of them by running `setup` again with a newer
+version of the tool. It lists what it will do and asks, like the other commands, and changes nothing which is already
+as it would make it. A file is one of three sorts:
+
+| Sort | Files | What setup does |
+|---|---|---|
+| Made | `rustfmt.toml`, `.github/workflows/ci.yml` for a library, the release workflow for an app | Writes it wholly from its template, with a comment at the top saying so. It is never edited by hand: `check` fails while it differs, and `setup` replaces it. |
+| Kept in part | `deny.toml` | Writes the licence policy, the same for every repository, from its template, and keeps the repository's own approvals, the crates approved by name, between the markers in its `exceptions`. |
+| Started | `LICENSE-MIT`, `LICENSE-APACHE`, `docs/ChangeLog.md`, and a library's `docs/Release.md` | Writes it only if it is missing; then it is the repository's own. |
+
+A repository's own steps in a made workflow are its **hooks**, local actions which it owns and which the workflow runs
+if they are there:
+
+| Hook | Run by | When |
+|---|---|---|
+| `.github/actions/before-bundle/action.yml` | An app's release workflow | Before the installers are built, e.g. to build programs which they include, and to set variables in `GITHUB_ENV` for the build. |
+
+On GitHub, `setup` allows pull requests to be merged only by squash merge. It lists the secrets the workflows use, by
+name only, e.g. the Apple signing secrets an app's workflow uses, and which of them the repository does not have; their
+values are set with `gh secret set`, by whoever holds them.
+
+An app's release workflow is made for a Dioxus desktop app, from its `Dioxus.toml` and `Cargo.lock`: the Dioxus CLI is
+the version Cargo.lock has, so `check` fails after Dioxus is updated until `setup` is run, and the Windows installer is
+checked to have put the programs in `external_bin` beside the app. `setup` does not yet make files for a repository of
+separate crates.
+
+`try` builds an app with the libraries it links, if it links any: the workflow checks out each linked library's branch
+beside the app, as on the developer's computer, and writes the same patch, so each must be committed and pushed. A
+release never takes linked libraries.
+
 ## Settings
 
 What a repository releases is set in its `Cargo.toml`, under `[package.metadata.bruce-method]`, or
@@ -182,9 +246,56 @@ What a repository releases is set in its `Cargo.toml`, under `[package.metadata.
 kind = "crate"
 ```
 
-Crates come first. Apps, which build installers and attach them to a draft GitHub release, and firmware, which
-attaches the builds for each board, follow, from the steps in Bruce's Smart Home's `scripts/release.sh`, which is used
-until then.
+An app also names its workflow, `release.yml` unless set, and lists the installers it builds, each with its platform,
+`<os>-<architecture>`, e.g. `macos-aarch64`, `macos-x64`, `windows-x64` or `windows-arm64`, and its file's name, with
+`{version}` for the version:
+
+```toml
+[package.metadata.bruce-method]
+kind = "app"
+workflow = "release.yml"
+installers = [
+    { platform = "macos-aarch64", file = "MyApp_{version}_aarch64.dmg" },
+    { platform = "windows-x64", file = "MyApp_{version}_x64-setup.exe" },
+]
+```
+
+The workflow is started by hand (`on: workflow_dispatch`), with two inputs: `tag`, the tag to build, `testX.Y.Z` or
+`releaseX.Y.Z`, and `attach`, a boolean, true to attach the installers to the draft GitHub release for the tag, which
+it should refuse to do to a published one. It keeps each platform's installer as an artifact of the run named for the
+platform, e.g. `macos-aarch64`. Bruce's Smart Home's `.github/workflows/release.yml` is one.
+
+Apps for Apple's App Store are `kind = "app-store"`, which lists each app, an iOS app made by Xcode, or a Mac app made
+with Dioxus, e.g. in a workspace's Cargo.toml:
+
+```toml
+[workspace.metadata.bruce-method]
+kind = "app-store"
+workflow = "release.yml"
+
+[[workspace.metadata.bruce-method.apps]]
+platform = "ios"
+project = "ios/MyApp.xcodeproj"
+scheme = "MyApp"
+swift-package = "ios/MyAppKit"   # optional: a Swift package whose tests CI runs
+
+[[workspace.metadata.bruce-method.apps]]
+platform = "macos"
+dioxus = "server"                # the Dioxus app's folder
+features = ["store"]             # optional: the App Store build's Cargo features
+entitlements = "server/store.entitlements"
+category = "public.app-category.trivia-games"
+exempt-encryption = true         # optional: its only encryption is exempt, e.g. HTTPS through Apple's frameworks
+```
+
+`setup` makes its release workflow, which builds each app on a GitHub Mac and signs it for App Store Connect, with
+automatic signing and an App Store Connect API key with the Admin role, so that no certificate or profile is kept in
+the repository's secrets; a Mac app made with Dioxus is put in an Xcode archive of its own, signed with its
+entitlements, for xcodebuild to export as it would one of Xcode's. With `upload` it uploads them, where they appear in
+TestFlight; submitting one for App Review is done in App Store Connect. Its CI runs on a Mac, with the iOS apps' Swift
+packages' tests. `try` and `release` do not drive it yet: run it from the Actions tab.
+
+Firmware, which attaches the builds for each board, is to follow.
 
 ## Needs
 

@@ -1,16 +1,16 @@
 //! `check`: the checks a release needs, changing nothing.
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::commands::setup;
 use crate::links;
 use crate::manifest::{Crate, Kind, Manifests};
+use crate::notes::{CHANGELOG, changelog_notes};
 use crate::process;
 use crate::repo::Repo;
 use crate::ui::Ui;
-use crate::version::Version;
 
 /// The result of one check.
 pub struct Check {
@@ -30,28 +30,6 @@ impl Check {
     pub fn failed(&self) -> bool {
         matches!(self.outcome, Outcome::Fail(_))
     }
-}
-
-/// The ChangeLog, in which each release has a `# Release X.Y.Z` section.
-pub const CHANGELOG: &str = "docs/ChangeLog.md";
-
-/// The notes of a version in the ChangeLog, the text of its section, or None if it has none.
-pub fn changelog_notes(dir: &Path, version: Version) -> Result<Option<String>> {
-    let file = dir.join(CHANGELOG);
-    if !file.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&file).with_context(|| format!("could not read {}", file.display()))?;
-    Ok(notes_in(&text, version))
-}
-
-/// The text of a version's section in a ChangeLog's text, up to the next top level heading.
-fn notes_in(text: &str, version: Version) -> Option<String> {
-    let heading = format!("# Release {version}");
-    let mut lines = text.lines().skip_while(|line| line.trim() != heading);
-    lines.next()?;
-    let notes: Vec<&str> = lines.take_while(|line| !line.starts_with("# ")).collect();
-    Some(notes.join("\n").trim().to_string())
 }
 
 /// Runs every check, reporting each as it starts, after fetching, so that a repository's state is compared with
@@ -172,6 +150,20 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
         ui,
     );
 
+    let outside = taken_by_path_from_outside(repo, &manifests);
+    add(
+        "Nothing taken by path from outside the repository",
+        if outside.is_empty() {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(format!(
+                "{}, which a build of only this repository would not find: release them, and take them from crates.io",
+                outside.join(", ")
+            ))
+        },
+        ui,
+    );
+
     add(
         "Every dependency is on crates.io, as Cargo.lock has it",
         if linked {
@@ -198,8 +190,10 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
         match version {
             Some(version) => match changelog_notes(&repo.dir, version)? {
                 Some(notes) if !notes.is_empty() => Outcome::Pass,
-                Some(_) => Outcome::Fail(format!("the # Release {version} section of {CHANGELOG} is empty")),
-                None => Outcome::Fail(format!("{CHANGELOG} has no # Release {version} section")),
+                Some(_) => Outcome::Fail(format!("the Release {version} section of {CHANGELOG} is empty")),
+                None => Outcome::Fail(format!(
+                    "{CHANGELOG} has no Release {version} section, under a heading, e.g. # Release {version}"
+                )),
             },
             None => Outcome::Skip("no version".to_string()),
         },
@@ -215,6 +209,20 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
         add(name, outcome, ui);
     }
 
+    add(
+        "Set up as the templates make it",
+        if !repo.is_workspace() {
+            Outcome::Skip("setup does not make files for separate crates yet".to_string())
+        } else {
+            match setup::drift(repo) {
+                Ok(drift) if drift.is_empty() => Outcome::Pass,
+                Ok(drift) => Outcome::Fail(format!("{}; run: bruce-method-release setup", drift.join(", "))),
+                Err(error) => Outcome::Fail(format!("{error:#}")),
+            }
+        },
+        ui,
+    );
+
     let outcome = if !repo.dir.join(".github/workflows").exists() {
         Outcome::Skip("no GitHub workflows".to_string())
     } else {
@@ -223,6 +231,26 @@ pub fn check(repo: &Repo, ui: &mut dyn Ui) -> Result<Vec<Check>> {
     add("CI passed on GitHub", outcome, ui);
 
     Ok(checks)
+}
+
+/// The dependencies the repository's crates take by path from outside it, e.g. a library from its checkout next to
+/// it, each as `<crate> from <path>`, as neither crates.io nor a GitHub workflow, which has only this repository, would
+/// find them.
+pub fn taken_by_path_from_outside(repo: &Repo, manifests: &Manifests) -> Vec<String> {
+    let root = repo.dir.canonicalize().unwrap_or_else(|_| repo.dir.clone());
+    let mut outside: Vec<String> = manifests
+        .crates
+        .iter()
+        .flat_map(|krate| &krate.dependencies)
+        .filter_map(|dependency| {
+            let path = dependency.path.as_ref()?;
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            (!path.starts_with(&root)).then(|| format!("{} from {}", dependency.name, path.display()))
+        })
+        .collect();
+    outside.sort();
+    outside.dedup();
+    outside
 }
 
 /// Whether the repository is formatted with rustfmt, by having its settings at its root.
@@ -444,7 +472,7 @@ fn ci_outcome(repo: &Repo, commit: &str) -> Result<Outcome> {
     let runs: Vec<serde_json::Value> = serde_json::from_str(&json).context("could not read gh's list of runs")?;
     if runs.is_empty() {
         return Ok(Outcome::Fail(format!(
-            "no run for the last commit, {}",
+            "no run for the last commit, {}; for an app, bruce-method-release try runs its workflow on it",
             &commit[..7.min(commit.len())]
         )));
     }
@@ -469,17 +497,4 @@ fn ci_outcome(repo: &Repo, commit: &str) -> Result<Outcome> {
     } else {
         Outcome::Fail(not_passed.join(", "))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_a_versions_notes() {
-        let text = "# ChangeLog\n\n# Release 0.2.0\n\n## New\n- A.\n\n# Release 0.1.0\n\n- First.\n";
-        assert_eq!(notes_in(text, "0.2.0".parse().unwrap()).unwrap(), "## New\n- A.");
-        assert_eq!(notes_in(text, "0.1.0".parse().unwrap()).unwrap(), "- First.");
-        assert_eq!(notes_in(text, "0.3.0".parse().unwrap()), None);
-    }
 }

@@ -1,0 +1,38 @@
+{{header}}
+#
+# Builds the App Store's apps for a tag, signs them for App Store Connect, and, with upload, uploads them there, where
+# they appear in TestFlight once Apple has processed them. The tag is testX.Y.Z, for bruce-method-release's try, which
+# builds and checks without uploading, or releaseX.Y.Z, for its release. Submitting a build for App Review is done in
+# App Store Connect.
+#
+# Signing is automatic: with the App Store Connect API key, xcodebuild makes the provisioning profiles and uses Apple's
+# cloud-managed distribution certificates, so no certificate or profile is kept in the repository's secrets. The key
+# needs the Admin role for that. A Mac app made with Dioxus is put in an Xcode archive of its own, so that xcodebuild
+# signs and uploads it as it does one Xcode made.
+#
+# Its secrets: APPLE_TEAM_ID, the team's ID; and the App Store Connect API key, APPLE_API_KEY (its ID),
+# APPLE_API_ISSUER (its issuer's ID) and APPLE_API_KEY_CONTENT (the .p8 file, base64 encoded).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build, e.g. release0.1.0"
+        required: true
+      upload:
+        description: "Upload the apps to App Store Connect"
+        type: boolean
+        default: false
+
+env:
+  TAG: ${{ inputs.tag }}
+  # The App Store's build number, which must go up with every upload of a version: the workflow's run number does.
+  BUILD: ${{ github.run_number }}
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+{{jobs}}

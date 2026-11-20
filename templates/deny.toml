@@ -1,0 +1,51 @@
+{{header}}
+#
+# cargo-deny's checks, run with `cargo deny check`: the licences of every crate in the build, the advisories against
+# them, and where they come from.
+
+[graph]
+all-features = true
+
+[licenses]
+# The licences approved for every crate: MIT and Apache-2.0, alone or as a choice; MPL-2.0, for a crate used unmodified;
+# Unicode-3.0, the Unicode Consortium's MIT-like licence for its tables; ISC and BSD-3-Clause; CDLA-Permissive-2.0, for
+# data such as Mozilla's root certificates; CC0-1.0, a dedication to the public domain; and BSL-1.0, the Boost licence,
+# which asks for its notice only with source. The notice of each but MIT, Apache-2.0, CC0-1.0 and BSL-1.0 goes in the
+# third-party notices. Any other licence fails until it is approved for a crate and listed below, with what pulls it in.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+# The list is the same in every repository, so a licence which no crate in this one has is not reported.
+unused-allowed-license = "allow"
+
+exceptions = [
+    # This repository's approvals, which setup keeps: each crate, the licences approved for it, and what pulls it in.
+{{approvals}}
+    # The end of this repository's approvals.
+]
+
+[advisories]
+# RustSec's advisories: a vulnerable crate fails, an unmaintained one is a warning, so that it is seen.
+unmaintained = "workspace"
+ignore = [
+    # This repository's ignored advisories, which setup keeps: each one, and why it does not apply or cannot be fixed.
+{{ignored}}
+    # The end of this repository's ignored advisories.
+]
+
+[bans]
+# {{multiple_versions_why}}
+multiple-versions = "{{multiple_versions}}"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

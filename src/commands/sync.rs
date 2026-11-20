@@ -10,6 +10,23 @@ use crate::repo::{self, Repo};
 use crate::ui::Ui;
 use crate::version::Version;
 
+/// The latest version's branch on GitHub, after fetching, if the checkout is on the branch of a version already
+/// released and there is a later one.
+fn moved_on(repo: &Repo) -> Result<Option<String>> {
+    let Some(current) = repo.branch()?.as_deref().and_then(Version::from_branch) else {
+        return Ok(None);
+    };
+    repo.fetch()?;
+    if !repo.releases()?.contains(&current) {
+        return Ok(None);
+    }
+    Ok(repo
+        .remote_branches()?
+        .last()
+        .filter(|latest| **latest > current)
+        .map(Version::branch))
+}
+
 /// One checkout's part of a sync.
 struct Update {
     repo: Repo,
@@ -22,7 +39,19 @@ struct Update {
 /// Brings a checkout and the libraries it links up to date with GitHub, by fast forward only, so that commits made on
 /// this computer are never lost or merged by accident, optionally switching the checkout to another branch first,
 /// then links the libraries next to it whose versions it requires are not published.
+///
+/// A branch may be given by its version, e.g. `0.6.0` for `v0.6.0`. With no branch, a checkout on the branch of a
+/// version already released moves on to the latest version's branch on GitHub, e.g. on a computer which tries each
+/// version's installers.
 pub fn sync(repo: &Repo, branch: Option<&str>, ui: &mut dyn Ui) -> Result<()> {
+    let branch = match branch {
+        Some(branch) => Some(match branch.parse::<Version>() {
+            Ok(version) => version.branch(),
+            Err(_) => branch.to_string(),
+        }),
+        None => moved_on(repo)?,
+    };
+    let branch = branch.as_deref();
     let mut repos = vec![repo.clone()];
     for patch in links::read(&repo.dir)? {
         let dir = patch.dir(&repo.dir);

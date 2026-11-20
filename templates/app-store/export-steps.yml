@@ -1,0 +1,33 @@
+      # Signs the archive for App Store Connect, making the provisioning profile and using the cloud-managed
+      # certificates, and uploads it, or, for a try, only exports it, which checks the signing as an upload would.
+      - name: Export {{what}} for App Store Connect
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          DESTINATION: ${{ inputs.upload && 'upload' || 'export' }}
+        run: |
+          options="$RUNNER_TEMP/ExportOptions.plist"
+          plutil -create xml1 "$options"
+          plutil -insert method -string app-store-connect "$options"
+          plutil -insert destination -string "$DESTINATION" "$options"
+          plutil -insert teamID -string "$TEAM" "$options"
+          plutil -insert signingStyle -string automatic "$options"
+          plutil -insert manageAppVersionAndBuildNumber -bool NO "$options"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$RUNNER_TEMP/dist" \
+            -exportOptionsPlist "$options" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$API_KEY" \
+            -authenticationKeyIssuerID "$API_ISSUER"
+          ls -l "$RUNNER_TEMP/dist"
+
+      - name: Keep {{what}}
+        if: ${{ !inputs.upload }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: {{artifact}}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error

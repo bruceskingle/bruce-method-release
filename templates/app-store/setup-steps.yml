@@ -1,0 +1,24 @@
+      - name: Check out {{repo}}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      # The version, from the tag, e.g. 0.1.0 from release0.1.0 or test0.1.0, and the API key, in a file, as
+      # xcodebuild needs it. They go to the later steps through GITHUB_ENV.
+      - name: Set up the version and the API key
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          if [ -z "$API_KEY" ] || [ -z "$API_KEY_CONTENT" ]; then
+            echo "The repository has no App Store Connect API key secrets, see the workflow's first comment"
+            exit 1
+          fi
+          version="${TAG#release}"
+          version="${version#test}"
+          key_path="$RUNNER_TEMP/AuthKey_$API_KEY.p8"
+          printf '%s' "$API_KEY_CONTENT" | base64 --decode > "$key_path"
+          {
+            echo "VERSION=$version"
+            echo "KEY_PATH=$key_path"
+          } >> "$GITHUB_ENV"

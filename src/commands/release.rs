@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::commands::app;
 use crate::commands::check::{self, Outcome};
 use crate::commands::link;
 use crate::commands::start::{self, StartPlan};
 use crate::links;
 use crate::manifest::{Crate, Kind, Manifests};
+use crate::notes;
 use crate::process;
 use crate::repo::{self, Repo};
 use crate::ui::Ui;
@@ -35,9 +37,12 @@ struct Unlink {
 /// their path dependencies on it, and starts the next version.
 pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
     let manifests = repo.manifests()?;
-    if manifests.kind != Kind::Crate {
+    if manifests.kind == Kind::App {
+        return app::release(repo, ui);
+    }
+    if manifests.kind == Kind::AppStore {
         bail!(
-            "{} is an app, whose releases are not done by this tool yet: use its own release steps",
+            "{} releases to the App Store, which this tool does not do yet: run its workflow from the Actions tab",
             repo.name
         );
     }
@@ -149,7 +154,7 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
         publish(repo, version, &manifests, &progress.unpublished, ui)?;
     }
     if !progress.github_release {
-        github_release(repo, version, ui)?;
+        github_release(repo, version, false, ui)?;
     }
     for unlink in &unlinks {
         link::remove_links(&unlink.repo, &unlink.names, ui)?;
@@ -170,15 +175,7 @@ pub fn release(repo: &Repo, ui: &mut dyn Ui) -> Result<()> {
 
 /// How far the release of a version has got, from GitHub and crates.io.
 fn progress(repo: &Repo, manifests: &Manifests, version: Version) -> Result<Progress> {
-    let branch = version.branch();
-    let merged = process::output(
-        &repo.dir,
-        "gh",
-        &[
-            "pr", "list", "--head", &branch, "--base", "main", "--state", "merged", "--json", "number",
-        ],
-    )?;
-    let merged = !serde_json::from_str::<Vec<serde_json::Value>>(&merged)?.is_empty();
+    let merged = pull_request_merged(repo, version)?;
     let tagged = repo.remote_tag_exists(&version.tag())?;
     let mut unpublished = Vec::new();
     for krate in manifests.crates.iter().filter(|krate| krate.publishable) {
@@ -193,6 +190,27 @@ fn progress(repo: &Repo, manifests: &Manifests, version: Version) -> Result<Prog
         unpublished,
         github_release,
     })
+}
+
+/// Whether a pull request from the version's branch into main has been merged.
+pub(crate) fn pull_request_merged(repo: &Repo, version: Version) -> Result<bool> {
+    let merged = process::output(
+        &repo.dir,
+        "gh",
+        &[
+            "pr",
+            "list",
+            "--head",
+            &version.branch(),
+            "--base",
+            "main",
+            "--state",
+            "merged",
+            "--json",
+            "number",
+        ],
+    )?;
+    Ok(!serde_json::from_str::<Vec<serde_json::Value>>(&merged)?.is_empty())
 }
 
 /// The repositories next to this one which link its crates at the version being released.
@@ -239,7 +257,7 @@ fn path_plans(repo: &Repo, version: Version) -> Result<Vec<link::PathPlan>> {
 }
 
 /// Squash merges the version's branch into main by pull request, opening one if there is none.
-fn merge(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn merge(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
     let branch = version.branch();
     let open = process::output(
         &repo.dir,
@@ -284,7 +302,7 @@ fn merge(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
 }
 
 /// Tags main, after checking that the merge left main the same as the branch.
-fn tag(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn tag(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
     if !process::run(&repo.dir, "git", &["diff", "--quiet", "origin/main", "HEAD"])?.success {
         bail!(
             "{}: main is not the same as {} after the merge, see git diff origin/main HEAD",
@@ -437,27 +455,32 @@ fn remove_worktree(repo: &Repo, worktree: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Makes the GitHub release of the tag, with the ChangeLog's notes for the version.
-fn github_release(repo: &Repo, version: Version, ui: &mut dyn Ui) -> Result<()> {
-    let notes = check::changelog_notes(&repo.dir, version)?.unwrap_or_default();
+/// Makes the GitHub release for the version's tag, with the notes from the ChangeLog at the tag, published, or a draft
+/// for an app's installers to be attached to and tried before it is published.
+pub(crate) fn github_release(repo: &Repo, version: Version, draft: bool, ui: &mut dyn Ui) -> Result<()> {
+    let tag = version.tag();
+    let notes = notes::release_notes(repo, version)?
+        .with_context(|| format!("{} at {tag} has no Release {version} section", notes::CHANGELOG))?;
     let file = std::env::temp_dir().join(format!("bruce-method-release-{}-{version}-notes.md", repo.name));
     fs::write(&file, notes).with_context(|| format!("could not write {}", file.display()))?;
-    ui.info(&format!("{}: making the GitHub release {}", repo.name, version.tag()));
+    let kind = if draft { "draft " } else { "" };
+    ui.info(&format!("{}: making the {kind}GitHub release {tag}", repo.name));
     let path = file.to_string_lossy().into_owned();
-    let made = process::output(
-        &repo.dir,
-        "gh",
-        &[
-            "release",
-            "create",
-            &version.tag(),
-            "--verify-tag",
-            "--title",
-            &format!("{} {version}", repo.name),
-            "--notes-file",
-            &path,
-        ],
-    );
+    let title = format!("{} {version}", repo.name);
+    let mut args = vec![
+        "release",
+        "create",
+        &tag,
+        "--verify-tag",
+        "--title",
+        &title,
+        "--notes-file",
+        &path,
+    ];
+    if draft {
+        args.push("--draft");
+    }
+    let made = process::output(&repo.dir, "gh", &args);
     let _ = fs::remove_file(&file);
     made.map(|_| ())
 }
